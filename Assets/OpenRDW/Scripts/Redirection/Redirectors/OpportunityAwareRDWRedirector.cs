@@ -641,18 +641,27 @@ public class OpportunityAwareRDWRedirector : Redirector
     public Vector2 GetRecommendedResetDirection()
     {
         TemporalState currentState = GetCurrentState();
-        float clearanceDelta = currentState.leftClearance - currentState.rightClearance;
-        float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
-        float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
-        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
-
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias, globalSafeField);
+        Vector2 desiredFacingDirection = ComputeResetFacingDirection(currentState);
         if (desiredFacingDirection.sqrMagnitude <= Utilities.eps)
         {
             return currentState.forwardReal;
         }
 
         return desiredFacingDirection.normalized;
+    }
+
+    public float GetRecommendedResetRotationDegrees()
+    {
+        TemporalState currentState = GetCurrentState();
+        Vector2 currentDirection = currentState.forwardReal.sqrMagnitude > Utilities.eps
+            ? currentState.forwardReal.normalized
+            : Utilities.FlattenedDir2D(redirectionManager.currDirReal);
+        Vector2 targetDirection = GetRecommendedResetDirection();
+        float targetAngle = Vector2.Angle(currentDirection, targetDirection);
+        float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
+
+        float minimumResetAngle = Mathf.Lerp(75f, 120f, boundaryRisk);
+        return Mathf.Clamp(Mathf.Max(targetAngle, minimumResetAngle), 75f, 180f);
     }
 
     // 计算期望朝向方向：结合追踪空间中心引导和侧向逃逸偏置
@@ -705,6 +714,40 @@ public class OpportunityAwareRDWRedirector : Redirector
             desiredFacingDirection = waypointDirection;
         }
         return desiredFacingDirection;
+    }
+
+    private Vector2 ComputeResetFacingDirection(TemporalState currentState)
+    {
+        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
+        Vector2 centerDirection = GetTrackingSpaceCentroid() - currentState.positionReal;
+        if (centerDirection.sqrMagnitude <= Utilities.eps)
+        {
+            centerDirection = currentState.forwardReal;
+        }
+        centerDirection.Normalize();
+
+        Vector2 awayFromBoundaryDirection = GetAwayFromNearestBoundaryDirection(currentState.positionReal);
+        if (awayFromBoundaryDirection.sqrMagnitude <= Utilities.eps)
+        {
+            awayFromBoundaryDirection = centerDirection;
+        }
+        awayFromBoundaryDirection.Normalize();
+
+        Vector2 globalSafeDirection = globalSafeField.direction.sqrMagnitude > Utilities.eps
+            ? globalSafeField.direction.normalized
+            : awayFromBoundaryDirection;
+
+        Vector2 desiredFacingDirection =
+            0.6f * globalSafeDirection +
+            0.3f * awayFromBoundaryDirection +
+            0.1f * centerDirection;
+
+        if (desiredFacingDirection.sqrMagnitude <= Utilities.eps)
+        {
+            desiredFacingDirection = centerDirection;
+        }
+
+        return desiredFacingDirection.normalized;
     }
 
     private Vector2 GetWaypointDirectionReal(TemporalState currentState)
@@ -786,6 +829,46 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         return delta.normalized / (distance * distance);
+    }
+
+    private Vector2 GetAwayFromNearestBoundaryDirection(Vector2 currentPositionReal)
+    {
+        float nearestDistance = float.MaxValue;
+        Vector2 nearestPoint = Vector2.zero;
+        bool foundNearest = false;
+
+        for (int i = 0; i < globalConfiguration.trackingSpacePoints.Count; i++)
+        {
+            Vector2 p = globalConfiguration.trackingSpacePoints[i];
+            Vector2 q = globalConfiguration.trackingSpacePoints[(i + 1) % globalConfiguration.trackingSpacePoints.Count];
+            Vector2 candidatePoint = Utilities.GetNearestPos(currentPositionReal, new List<Vector2> { p, q });
+            float candidateDistance = Vector2.Distance(currentPositionReal, candidatePoint);
+            if (candidateDistance < nearestDistance)
+            {
+                nearestDistance = candidateDistance;
+                nearestPoint = candidatePoint;
+                foundNearest = true;
+            }
+        }
+
+        foreach (var obstaclePolygon in globalConfiguration.obstaclePolygons)
+        {
+            Vector2 candidatePoint = Utilities.GetNearestPos(currentPositionReal, obstaclePolygon);
+            float candidateDistance = Vector2.Distance(currentPositionReal, candidatePoint);
+            if (candidateDistance < nearestDistance)
+            {
+                nearestDistance = candidateDistance;
+                nearestPoint = candidatePoint;
+                foundNearest = true;
+            }
+        }
+
+        if (!foundNearest)
+        {
+            return Vector2.zero;
+        }
+
+        return currentPositionReal - nearestPoint;
     }
 
     private int ApplySteeringHysteresis(int candidateDirection, float steerabilityConfidence, float boundaryRisk, float deltaTime)

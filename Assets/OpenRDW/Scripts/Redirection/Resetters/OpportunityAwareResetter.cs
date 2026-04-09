@@ -2,10 +2,7 @@
 
 public class OpportunityAwareResetter : Resetter
 {
-    [Min(0f)]
-    public float minResetRotationDegrees = 30f;
-
-    [Range(30f, 180f)]
+    [Range(75f, 180f)]
     public float maxResetRotationDegrees = 180f;
 
     [Min(0.1f)]
@@ -22,7 +19,10 @@ public class OpportunityAwareResetter : Resetter
 
     public override void InitializeReset()
     {
-        Vector2 targetDirection = GetTargetDirection();
+        var opportunityAware = GetOpportunityAwareRedirector();
+        Vector2 targetDirection = opportunityAware != null
+            ? opportunityAware.GetRecommendedResetDirection()
+            : Utilities.FlattenedDir2D(redirectionManager.currDirReal);
         Vector2 currentDirection = Utilities.FlattenedDir2D(redirectionManager.currDirReal);
         if (targetDirection.sqrMagnitude <= Utilities.eps)
         {
@@ -39,15 +39,10 @@ public class OpportunityAwareResetter : Resetter
             rotateDir = 1f;
         }
 
-        float requestedRotation = Mathf.Abs(signedAngle);
-        if (requestedRotation > Utilities.eps)
-        {
-            requestedRotation = Mathf.Clamp(requestedRotation, minResetRotationDegrees, maxResetRotationDegrees);
-        }
-        else
-        {
-            requestedRotation = 180f;
-        }
+        float requestedRotation = opportunityAware != null
+            ? opportunityAware.GetRecommendedResetRotationDegrees()
+            : 180f;
+        requestedRotation = Mathf.Clamp(requestedRotation, 75f, maxResetRotationDegrees);
 
         requiredRotateSteerAngle = requestedRotation;
         requiredRotateAngle = requestedRotation;
@@ -97,15 +92,8 @@ public class OpportunityAwareResetter : Resetter
         redirectionManager.simulatedWalker.RotateInPlace(rotateAngle * rotateDir);
     }
 
-    private Vector2 GetTargetDirection()
+    private OpportunityAwareRDWRedirector GetOpportunityAwareRedirector()
     {
-        var opportunityAware = redirectionManager.redirector as OpportunityAwareRDWRedirector;
-        if (opportunityAware != null)
-        {
-            return opportunityAware.GetRecommendedResetDirection();
-        }
-
-        Debug.LogError("OpportunityAwareResetter requires OpportunityAwareRDWRedirector");
-        return Utilities.FlattenedDir2D(redirectionManager.currDirReal);
+        return redirectionManager.redirector as OpportunityAwareRDWRedirector;
     }
 }

@@ -20,6 +20,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         public float speed;
         public float angularSpeed;
         public float nearestBoundaryDistance;
+        public float predictedBoundaryDistance;
         public float leftClearance;
         public float rightClearance;
         public float distanceToCenter;
@@ -92,6 +93,15 @@ public class OpportunityAwareRDWRedirector : Redirector
 
     [Min(0.2f)]
     public float comfortableBoundaryDistance = 2.0f;
+
+    [Min(0f)]
+    public float forwardPredictionDistance = 1.25f;
+
+    [Range(0f, 1f)]
+    public float predictionWeight = 0.45f;
+
+    [Min(0f)]
+    public float predictionLateralSpread = 0.35f;
 
     [Range(0f, 1f)]
     public float lateralEscapeBlendAtCriticalRisk = 0.5f;
@@ -180,6 +190,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     [SerializeField]
     private float lastBoundaryDistance;
     [SerializeField]
+    private float lastPredictedBoundaryDistance;
+    [SerializeField]
     private int lastSteerDirection;
     [SerializeField]
     private bool lastUsedCriticalFallback;
@@ -244,6 +256,7 @@ public class OpportunityAwareRDWRedirector : Redirector
             globalConfiguration.obstaclePolygons,
             globalConfiguration.trackingSpacePoints,
             currPosReal);
+        float predictedBoundaryDistance = EstimatePredictedBoundaryDistance(currPosReal, currForwardReal);
 
         // 这是启发式预测器使用的紧凑"状态"。
         // 它混合了运动线索、空间安全线索、任务线索以及控制器自身的前一个输出，
@@ -255,6 +268,7 @@ public class OpportunityAwareRDWRedirector : Redirector
             speed = (currPosReal - prevPosReal).magnitude / deltaTime,
             angularSpeed = Mathf.Abs(Utilities.GetSignedAngle(redirectionManager.prevDirReal, redirectionManager.currDirReal)) / deltaTime,
             nearestBoundaryDistance = nearestBoundaryDistance,
+            predictedBoundaryDistance = predictedBoundaryDistance,
             leftClearance = EstimateDirectionalClearance(currPosReal, Utilities.RotateVector(currForwardReal, -90f)),
             rightClearance = EstimateDirectionalClearance(currPosReal, Utilities.RotateVector(currForwardReal, 90f)),
             distanceToCenter = toCenter.magnitude,
@@ -302,7 +316,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         int desiredDirection = ComputeDesiredSteeringDirection(desiredFacingDirection);
         float steerabilityMagnitude = Mathf.Clamp01(Mathf.Abs(clearanceBias));
 
-        float boundaryRisk = ComputeBoundaryRisk(currentState.nearestBoundaryDistance);
+        float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
         float budgetFactor = Mathf.Clamp01(
             minBudgetFactor
             + boundaryRiskBudgetWeight * boundaryRisk
@@ -332,7 +346,7 @@ public class OpportunityAwareRDWRedirector : Redirector
     {
         TemporalState currentState = GetCurrentState();
         float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
-        float boundaryRisk = ComputeBoundaryRisk(currentState.nearestBoundaryDistance);
+        float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
         float clearanceDelta = currentState.leftClearance - currentState.rightClearance;
         float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
         float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
@@ -405,7 +419,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
-        float boundaryRisk = ComputeBoundaryRisk(GetCurrentState().nearestBoundaryDistance);
+        float boundaryRisk = ComputeCombinedBoundaryRisk(GetCurrentState());
         bool highRiskOverride = boundaryRisk >= highRiskOverrideThreshold;
         if (highRiskOverride)
         {
@@ -488,12 +502,15 @@ public class OpportunityAwareRDWRedirector : Redirector
         lastBaseControlSuggestion = new Vector3(baseControl.curvatureDegrees, baseControl.rotationDegrees, baseControl.translationGain);
         lastFinalAppliedGains = previousAppliedGains;
         lastBoundaryDistance = currentState.nearestBoundaryDistance;
+        lastPredictedBoundaryDistance = currentState.predictedBoundaryDistance;
         lastSteerDirection = selectedSteeringDirection;
         lastUsedCriticalFallback = usedCriticalFallback;
         lastDecisionSummary = string.Format(
-            "O={0:F2}, steer={1:F2}, budget=({2:F2},{3:F2},{4:F2}), base=({5:F2},{6:F2},{7:F2}), final=({8:F2},{9:F2},{10:F2}), naturalTurn={11}, decel={12}, criticalFallback={13}, postResetBoost={14:F2}",
+            "O={0:F2}, steer={1:F2}, boundary=({2:F2}->{3:F2}), budget=({4:F2},{5:F2},{6:F2}), base=({7:F2},{8:F2},{9:F2}), final=({10:F2},{11:F2},{12:F2}), naturalTurn={13}, decel={14}, criticalFallback={15}, postResetBoost={16:F2}",
             predictor.opportunityScore,
             predictor.steerability,
+            currentState.nearestBoundaryDistance,
+            currentState.predictedBoundaryDistance,
             predictor.gainBudget.x,
             predictor.gainBudget.y,
             predictor.gainBudget.z,
@@ -617,7 +634,7 @@ public class OpportunityAwareRDWRedirector : Redirector
             : Utilities.RotateVector(currentState.forwardReal, 90f);
         saferLateralDirection.Normalize();
 
-        float boundaryRisk = ComputeBoundaryRisk(currentState.nearestBoundaryDistance);
+        float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
         float waypointBlend = Mathf.Lerp(waypointBlendWhenSafe, waypointBlendAtCriticalRisk, boundaryRisk);
         float centerBlend = Mathf.Lerp(centerBlendWhenSafe, centerBlendAtCriticalRisk, boundaryRisk);
         float lateralBlend = Mathf.Lerp(lateralEscapeBlendWhenSafe, lateralEscapeBlendAtCriticalRisk, boundaryRisk);
@@ -716,6 +733,13 @@ public class OpportunityAwareRDWRedirector : Redirector
         return desiredSteeringDirection;
     }
 
+    private float ComputeCombinedBoundaryRisk(TemporalState currentState)
+    {
+        float instantRisk = ComputeBoundaryRisk(currentState.nearestBoundaryDistance);
+        float predictedRisk = ComputeBoundaryRisk(currentState.predictedBoundaryDistance);
+        return Mathf.Max(instantRisk, Mathf.Lerp(instantRisk, predictedRisk, predictionWeight));
+    }
+
     // 估计指定方向的间隙距离（用于左右间隙检测）
     private float EstimateDirectionalClearance(Vector2 origin, Vector2 direction)
     {
@@ -748,6 +772,39 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         return minDistance;
+    }
+
+    private float EstimatePredictedBoundaryDistance(Vector2 origin, Vector2 forward)
+    {
+        if (forwardPredictionDistance <= Utilities.eps || forward.sqrMagnitude <= Utilities.eps)
+        {
+            return Utilities.GetNearestDistToObstacleAndTrackingSpace(
+                globalConfiguration.obstaclePolygons,
+                globalConfiguration.trackingSpacePoints,
+                origin);
+        }
+
+        Vector2 normalizedForward = forward.normalized;
+        Vector2 right = Utilities.RotateVector(normalizedForward, 90f);
+
+        Vector2 forwardPoint = origin + normalizedForward * forwardPredictionDistance;
+        Vector2 forwardLeftPoint = forwardPoint - right * predictionLateralSpread;
+        Vector2 forwardRightPoint = forwardPoint + right * predictionLateralSpread;
+
+        float forwardDistance = Utilities.GetNearestDistToObstacleAndTrackingSpace(
+            globalConfiguration.obstaclePolygons,
+            globalConfiguration.trackingSpacePoints,
+            forwardPoint);
+        float forwardLeftDistance = Utilities.GetNearestDistToObstacleAndTrackingSpace(
+            globalConfiguration.obstaclePolygons,
+            globalConfiguration.trackingSpacePoints,
+            forwardLeftPoint);
+        float forwardRightDistance = Utilities.GetNearestDistToObstacleAndTrackingSpace(
+            globalConfiguration.obstaclePolygons,
+            globalConfiguration.trackingSpacePoints,
+            forwardRightPoint);
+
+        return Mathf.Min(forwardDistance, Mathf.Min(forwardLeftDistance, forwardRightDistance));
     }
 
     // 计算射线与线段之间的距离（用于间隙检测）

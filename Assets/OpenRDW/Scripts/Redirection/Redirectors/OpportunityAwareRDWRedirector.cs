@@ -140,6 +140,16 @@ public class OpportunityAwareRDWRedirector : Redirector
     [Range(0f, 1f)]
     public float secondaryAngularGainRatio = 0.35f;
 
+    [Header("转向稳定性 (Steering Hysteresis)")]
+    [Min(0f)]
+    public float steeringLockDuration = 0.75f;
+
+    [Range(0f, 1f)]
+    public float steeringSwitchConfidence = 0.3f;
+
+    [Range(0f, 1f)]
+    public float highRiskSteeringUnlockThreshold = 0.85f;
+
     [Header("Reset 恢复 (Reset Recovery)")]
     [Min(0f)]
     public float postResetBoostDuration = 0.75f;
@@ -179,6 +189,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     private readonly List<TemporalState> stateHistory = new List<TemporalState>();
     private Vector3 previousAppliedGains = Vector3.zero;
     private int previousSteeringDirection = 1;
+    private int lockedSteeringDirection = 1;
+    private float steeringLockTimer;
     private int updateCounter;
     private float postResetBoostTimer;
 
@@ -208,6 +220,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     {
         stateHistory.Clear();
         previousAppliedGains *= postResetGainRetention;
+        lockedSteeringDirection = previousSteeringDirection;
+        steeringLockTimer = steeringLockDuration * 0.5f;
         postResetBoostTimer = postResetBoostDuration;
         updateCounter = 0;
     }
@@ -403,6 +417,12 @@ public class OpportunityAwareRDWRedirector : Redirector
             effectiveAlpha = Mathf.Max(effectiveAlpha, postResetAlphaFloor);
             postResetBoostTimer = Mathf.Max(0f, postResetBoostTimer - deltaTime);
         }
+
+        selectedSteeringDirection = ApplySteeringHysteresis(
+            selectedSteeringDirection,
+            Mathf.Abs(predictor.steerability),
+            boundaryRisk,
+            deltaTime);
 
         float curvatureBudget = predictor.gainBudget.x;
         float rotationBudget = predictor.gainBudget.y;
@@ -640,6 +660,38 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         return waypointDirectionReal.normalized;
+    }
+
+    private int ApplySteeringHysteresis(int candidateDirection, float steerabilityConfidence, float boundaryRisk, float deltaTime)
+    {
+        if (candidateDirection == 0)
+        {
+            candidateDirection = lockedSteeringDirection != 0 ? lockedSteeringDirection : previousSteeringDirection;
+        }
+
+        steeringLockTimer = Mathf.Max(0f, steeringLockTimer - deltaTime);
+
+        bool sameDirection = candidateDirection == lockedSteeringDirection;
+        bool highRiskUnlock = boundaryRisk >= highRiskSteeringUnlockThreshold;
+        bool strongEnoughToSwitch = steerabilityConfidence >= steeringSwitchConfidence;
+
+        if (sameDirection)
+        {
+            if (steerabilityConfidence >= steeringEpsilon)
+            {
+                steeringLockTimer = Mathf.Max(steeringLockTimer, steeringLockDuration * 0.5f);
+            }
+            return lockedSteeringDirection;
+        }
+
+        if (steeringLockTimer > 0f && !highRiskUnlock && !strongEnoughToSwitch)
+        {
+            return lockedSteeringDirection;
+        }
+
+        lockedSteeringDirection = candidateDirection;
+        steeringLockTimer = steeringLockDuration;
+        return lockedSteeringDirection;
     }
 
     // 计算期望转向方向（左转或右转）

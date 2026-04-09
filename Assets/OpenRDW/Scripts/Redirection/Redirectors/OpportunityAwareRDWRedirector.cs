@@ -40,6 +40,12 @@ public class OpportunityAwareRDWRedirector : Redirector
         public bool decelerationDetected;
     }
 
+    private struct GlobalSafeField
+    {
+        public Vector2 direction;
+        public float strength;
+    }
+
     private struct BaseControlProposal
     {
         public float curvatureDegrees;
@@ -122,6 +128,18 @@ public class OpportunityAwareRDWRedirector : Redirector
     [Range(0f, 1f)]
     public float centerBlendAtCriticalRisk = 0.2f;
 
+    [Range(0f, 1f)]
+    public float globalSafeBlendWhenSafe = 0.4f;
+
+    [Range(0f, 1f)]
+    public float globalSafeBlendAtCriticalRisk = 0.6f;
+
+    [Min(0.01f)]
+    public float globalSafeMinDistance = 0.15f;
+
+    [Min(0.1f)]
+    public float globalSafeStrengthHigh = 3.5f;
+
     [Header("增益调度 (Gain Scheduling)")]
     [Range(0f, 1f)]
     public float minBudgetFactor = 0.6f;
@@ -191,6 +209,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     private float lastBoundaryDistance;
     [SerializeField]
     private float lastPredictedBoundaryDistance;
+    [SerializeField]
+    private float lastGlobalSafeStrength;
     [SerializeField]
     private int lastSteerDirection;
     [SerializeField]
@@ -312,9 +332,10 @@ public class OpportunityAwareRDWRedirector : Redirector
         float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
         float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
 
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias);
+        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias, globalSafeField);
         int desiredDirection = ComputeDesiredSteeringDirection(desiredFacingDirection);
-        float steerabilityMagnitude = Mathf.Clamp01(Mathf.Abs(clearanceBias));
+        float steerabilityMagnitude = Mathf.Clamp01(Mathf.Max(Mathf.Abs(clearanceBias), globalSafeField.strength));
 
         float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
         float budgetFactor = Mathf.Clamp01(
@@ -351,7 +372,8 @@ public class OpportunityAwareRDWRedirector : Redirector
         float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
         float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
 
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias);
+        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias, globalSafeField);
         int desiredDirection = ComputeDesiredSteeringDirection(desiredFacingDirection);
         if (desiredDirection == 0)
         {
@@ -503,14 +525,16 @@ public class OpportunityAwareRDWRedirector : Redirector
         lastFinalAppliedGains = previousAppliedGains;
         lastBoundaryDistance = currentState.nearestBoundaryDistance;
         lastPredictedBoundaryDistance = currentState.predictedBoundaryDistance;
+        lastGlobalSafeStrength = ComputeGlobalSafeField(currentState).strength;
         lastSteerDirection = selectedSteeringDirection;
         lastUsedCriticalFallback = usedCriticalFallback;
         lastDecisionSummary = string.Format(
-            "O={0:F2}, steer={1:F2}, boundary=({2:F2}->{3:F2}), budget=({4:F2},{5:F2},{6:F2}), base=({7:F2},{8:F2},{9:F2}), final=({10:F2},{11:F2},{12:F2}), naturalTurn={13}, decel={14}, criticalFallback={15}, postResetBoost={16:F2}",
+            "O={0:F2}, steer={1:F2}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), final=({11:F2},{12:F2},{13:F2}), naturalTurn={14}, decel={15}, criticalFallback={16}, postResetBoost={17:F2}",
             predictor.opportunityScore,
             predictor.steerability,
             currentState.nearestBoundaryDistance,
             currentState.predictedBoundaryDistance,
+            lastGlobalSafeStrength,
             predictor.gainBudget.x,
             predictor.gainBudget.y,
             predictor.gainBudget.z,
@@ -615,13 +639,15 @@ public class OpportunityAwareRDWRedirector : Redirector
     }
 
     // 计算期望朝向方向：结合追踪空间中心引导和侧向逃逸偏置
-    private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, float clearanceBias)
+    private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, float clearanceBias, GlobalSafeField globalSafeField)
     {
-        // 控制器混合三种直觉：
+        // 控制器混合四种直觉：
         // 1) 跟随当前 waypoint 的任务方向
-        // 2) 转向回到追踪空间中心
-        // 3) 偏向有更多侧向自由空间的一侧
+        // 2) 跟随 APF 风格的全局安全方向
+        // 3) 转向回到追踪空间中心
+        // 4) 偏向有更多侧向自由空间的一侧
         Vector2 waypointDirection = GetWaypointDirectionReal(currentState);
+        Vector2 globalSafeDirection = globalSafeField.direction;
         Vector2 centerDirection = GetTrackingSpaceCentroid() - currentState.positionReal;
         if (centerDirection.sqrMagnitude <= Utilities.eps)
         {
@@ -636,13 +662,20 @@ public class OpportunityAwareRDWRedirector : Redirector
 
         float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
         float waypointBlend = Mathf.Lerp(waypointBlendWhenSafe, waypointBlendAtCriticalRisk, boundaryRisk);
+        float globalSafeBlend = Mathf.Lerp(globalSafeBlendWhenSafe, globalSafeBlendAtCriticalRisk, boundaryRisk);
         float centerBlend = Mathf.Lerp(centerBlendWhenSafe, centerBlendAtCriticalRisk, boundaryRisk);
         float lateralBlend = Mathf.Lerp(lateralEscapeBlendWhenSafe, lateralEscapeBlendAtCriticalRisk, boundaryRisk);
         lateralBlend *= Mathf.Clamp01(Mathf.Abs(clearanceBias));
 
-        float totalBlend = waypointBlend + centerBlend + lateralBlend;
+        if (globalSafeField.strength <= Utilities.eps)
+        {
+            globalSafeBlend = 0f;
+        }
+
+        float totalBlend = waypointBlend + globalSafeBlend + centerBlend + lateralBlend;
         Vector2 desiredFacingDirection =
             waypointBlend * waypointDirection +
+            globalSafeBlend * globalSafeDirection +
             centerBlend * centerDirection +
             lateralBlend * saferLateralDirection;
         if (totalBlend > Utilities.eps)
@@ -677,6 +710,65 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         return waypointDirectionReal.normalized;
+    }
+
+    private GlobalSafeField ComputeGlobalSafeField(TemporalState currentState)
+    {
+        Vector2 currPosReal = currentState.positionReal;
+        Vector2 accumulatedForce = Vector2.zero;
+
+        for (int i = 0; i < globalConfiguration.trackingSpacePoints.Count; i++)
+        {
+            Vector2 p = globalConfiguration.trackingSpacePoints[i];
+            Vector2 q = globalConfiguration.trackingSpacePoints[(i + 1) % globalConfiguration.trackingSpacePoints.Count];
+            Vector2 nearestPos = Utilities.GetNearestPos(currPosReal, new List<Vector2> { p, q });
+            accumulatedForce += GetRepulsiveContribution(currPosReal, nearestPos);
+        }
+
+        foreach (var obstaclePolygon in globalConfiguration.obstaclePolygons)
+        {
+            Vector2 nearestPos = Utilities.GetNearestPos(currPosReal, obstaclePolygon);
+            accumulatedForce += GetRepulsiveContribution(currPosReal, nearestPos);
+        }
+
+        foreach (var user in globalConfiguration.redirectedAvatars)
+        {
+            var rm = user.GetComponent<RedirectionManager>();
+            if (rm == null || rm == redirectionManager)
+            {
+                continue;
+            }
+
+            Vector2 otherPos = Utilities.FlattenedPos2D(rm.currPosReal);
+            accumulatedForce += 0.35f * GetRepulsiveContribution(currPosReal, otherPos);
+        }
+
+        if (accumulatedForce.sqrMagnitude <= Utilities.eps)
+        {
+            return new GlobalSafeField
+            {
+                direction = currentState.forwardReal,
+                strength = 0f
+            };
+        }
+
+        return new GlobalSafeField
+        {
+            direction = accumulatedForce.normalized,
+            strength = NormalizeRange(accumulatedForce.magnitude, 0f, globalSafeStrengthHigh)
+        };
+    }
+
+    private Vector2 GetRepulsiveContribution(Vector2 currPosReal, Vector2 nearestPos)
+    {
+        Vector2 delta = currPosReal - nearestPos;
+        float distance = Mathf.Max(delta.magnitude, globalSafeMinDistance);
+        if (distance <= Utilities.eps)
+        {
+            return Vector2.zero;
+        }
+
+        return delta.normalized / (distance * distance);
     }
 
     private int ApplySteeringHysteresis(int candidateDirection, float steerabilityConfidence, float boundaryRisk, float deltaTime)

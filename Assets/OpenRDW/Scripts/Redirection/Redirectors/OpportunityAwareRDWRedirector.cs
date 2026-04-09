@@ -140,6 +140,16 @@ public class OpportunityAwareRDWRedirector : Redirector
     [Range(0f, 1f)]
     public float secondaryAngularGainRatio = 0.35f;
 
+    [Header("Reset 恢复 (Reset Recovery)")]
+    [Min(0f)]
+    public float postResetBoostDuration = 0.75f;
+
+    [Range(0f, 1f)]
+    public float postResetGainRetention = 0.4f;
+
+    [Range(0f, 1f)]
+    public float postResetAlphaFloor = 0.85f;
+
     [Header("调试 (Debug)")]
     public bool enableRuntimeLogging = true;
     public bool verboseRuntimeLogging = false;
@@ -170,6 +180,7 @@ public class OpportunityAwareRDWRedirector : Redirector
     private Vector3 previousAppliedGains = Vector3.zero;
     private int previousSteeringDirection = 1;
     private int updateCounter;
+    private float postResetBoostTimer;
 
     public override void InjectRedirection()
     {
@@ -196,8 +207,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     private void ResetInternalState()
     {
         stateHistory.Clear();
-        previousAppliedGains = Vector3.zero;
-        previousSteeringDirection = 1;
+        previousAppliedGains *= postResetGainRetention;
+        postResetBoostTimer = postResetBoostDuration;
         updateCounter = 0;
     }
 
@@ -379,6 +390,7 @@ public class OpportunityAwareRDWRedirector : Redirector
             selectedSteeringDirection = previousSteeringDirection;
         }
 
+        float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
         float boundaryRisk = ComputeBoundaryRisk(GetCurrentState().nearestBoundaryDistance);
         bool highRiskOverride = boundaryRisk >= highRiskOverrideThreshold;
         if (highRiskOverride)
@@ -386,7 +398,12 @@ public class OpportunityAwareRDWRedirector : Redirector
             effectiveAlpha = Mathf.Max(effectiveAlpha, 0.9f);
         }
 
-        float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
+        if (postResetBoostTimer > 0f)
+        {
+            effectiveAlpha = Mathf.Max(effectiveAlpha, postResetAlphaFloor);
+            postResetBoostTimer = Mathf.Max(0f, postResetBoostTimer - deltaTime);
+        }
+
         float curvatureBudget = predictor.gainBudget.x;
         float rotationBudget = predictor.gainBudget.y;
         if (highRiskOverride)
@@ -454,7 +471,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         lastSteerDirection = selectedSteeringDirection;
         lastUsedCriticalFallback = usedCriticalFallback;
         lastDecisionSummary = string.Format(
-            "O={0:F2}, steer={1:F2}, budget=({2:F2},{3:F2},{4:F2}), base=({5:F2},{6:F2},{7:F2}), final=({8:F2},{9:F2},{10:F2}), naturalTurn={11}, decel={12}, criticalFallback={13}",
+            "O={0:F2}, steer={1:F2}, budget=({2:F2},{3:F2},{4:F2}), base=({5:F2},{6:F2},{7:F2}), final=({8:F2},{9:F2},{10:F2}), naturalTurn={11}, decel={12}, criticalFallback={13}, postResetBoost={14:F2}",
             predictor.opportunityScore,
             predictor.steerability,
             predictor.gainBudget.x,
@@ -468,7 +485,8 @@ public class OpportunityAwareRDWRedirector : Redirector
             previousAppliedGains.z,
             predictor.naturalTurningDetected,
             predictor.decelerationDetected,
-            usedCriticalFallback);
+            usedCriticalFallback,
+            postResetBoostTimer);
 
         if (enableRuntimeLogging && (verboseRuntimeLogging || updateCounter % debugLogEveryNFrames == 0))
         {

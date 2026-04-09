@@ -1,12 +1,11 @@
 using UnityEngine;
 using System.Collections.Generic;
 
-// Opportunity-Aware RDW Controller 的第一版验证实现。
-// 该控制器保留了 OpenRDW 原有的注入路径，但在注入之前插入了一层轻量级决策层：
-// 1）收集一小段时间窗口内的状态历史
-// 2）估计机会度 / 可转向性 / 增益预算
-// 3）在安全性与平滑性约束下调度增益
-// 4）通过现有 API 注入平移 / 旋转 / 曲率增益
+// Opportunity-Aware RDW Controller 当前实现：
+// 1）底层使用 APF 风格全局安全方向作为 subtle redirection 的方向骨架
+// 2）机会层只估计“当前是否更适合隐藏增益”，不再覆盖 APF 方向
+// 3）调度层只做轻量缩放与上限保护
+// 4）高风险时直接退回纯 APF 输出
 public class OpportunityAwareRDWRedirector : Redirector
 {
     private const float DefaultRotationCapDegreesPerSecond = 30f;
@@ -34,6 +33,7 @@ public class OpportunityAwareRDWRedirector : Redirector
     {
         public float opportunityScore;
         public float steerability;
+        public int directionalConsistency;
         public Vector3 gainBudget;
         public bool criticalBoundaryRisk;
         public bool naturalTurningDetected;
@@ -82,13 +82,7 @@ public class OpportunityAwareRDWRedirector : Redirector
     public float decelerationOpportunityHigh = 0.3f;
 
     [Range(0f, 1f)]
-    public float minOpportunityAlpha = 0.65f;
-
-    [Range(0f, 1f)]
     public float lowOpportunityThreshold = 0.25f;
-
-    [Range(0f, 1f)]
-    public float fallbackAlphaOnCriticalRisk = 1f;
 
     [Range(0f, 1f)]
     public float steeringEpsilon = 0.12f;
@@ -109,30 +103,7 @@ public class OpportunityAwareRDWRedirector : Redirector
     [Min(0f)]
     public float predictionLateralSpread = 0.35f;
 
-    [Range(0f, 1f)]
-    public float lateralEscapeBlendAtCriticalRisk = 0.5f;
-
-    [Range(0f, 1f)]
-    public float lateralEscapeBlendWhenSafe = 0.15f;
-
-    [Header("任务引导 (Task Guidance)")]
-    [Range(0f, 1f)]
-    public float waypointBlendWhenSafe = 0.55f;
-
-    [Range(0f, 1f)]
-    public float waypointBlendAtCriticalRisk = 0.3f;
-
-    [Range(0f, 1f)]
-    public float centerBlendWhenSafe = 0.3f;
-
-    [Range(0f, 1f)]
-    public float centerBlendAtCriticalRisk = 0.2f;
-
-    [Range(0f, 1f)]
-    public float globalSafeBlendWhenSafe = 0.4f;
-
-    [Range(0f, 1f)]
-    public float globalSafeBlendAtCriticalRisk = 0.6f;
+    [Header("APF 安全骨架 (APF Backbone)")]
 
     [Min(0.01f)]
     public float globalSafeMinDistance = 0.15f;
@@ -142,16 +113,16 @@ public class OpportunityAwareRDWRedirector : Redirector
 
     [Header("增益调度 (Gain Scheduling)")]
     [Range(0f, 1f)]
-    public float minBudgetFactor = 0.6f;
+    public float minBudgetFactor = 0.95f;
 
     [Range(0f, 1f)]
-    public float boundaryRiskBudgetWeight = 0.55f;
+    public float boundaryRiskBudgetWeight = 0.05f;
 
     [Range(0f, 1f)]
-    public float steerabilityBudgetWeight = 0.35f;
+    public float steerabilityBudgetWeight = 0.0f;
 
     [Range(0f, 1f)]
-    public float opportunityBudgetWeight = 0.1f;
+    public float opportunityBudgetWeight = 0.0f;
 
     [Range(0f, 1f)]
     public float gainSmoothingFactor = 0.45f;
@@ -163,10 +134,26 @@ public class OpportunityAwareRDWRedirector : Redirector
     public float highRiskOverrideThreshold = 0.6f;
 
     [Range(0f, 1f)]
-    public float highRiskBudgetFloor = 0.85f;
-
-    [Range(0f, 1f)]
     public float secondaryAngularGainRatio = 0.35f;
+
+    [Header("机会软调制 (Soft Opportunity Modulation)")]
+    [Range(0.8f, 1f)]
+    public float lowOpportunityConflictBeta = 0.9f;
+
+    [Range(0.9f, 1.05f)]
+    public float lowOpportunityNeutralBeta = 0.98f;
+
+    [Range(0.95f, 1.05f)]
+    public float neutralOpportunityBeta = 1f;
+
+    [Range(1f, 1.1f)]
+    public float highOpportunityNeutralBeta = 1.05f;
+
+    [Range(1f, 1.2f)]
+    public float highOpportunityAlignedBeta = 1.1f;
+
+    [Range(1f, 1.5f)]
+    public float baseBudgetCapScale = 1.15f;
 
     [Header("转向稳定性 (Steering Hysteresis)")]
     [Min(0f)]
@@ -211,6 +198,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     private float lastPredictedBoundaryDistance;
     [SerializeField]
     private float lastGlobalSafeStrength;
+    [SerializeField]
+    private int lastDirectionalConsistency;
     [SerializeField]
     private int lastSteerDirection;
     [SerializeField]
@@ -326,16 +315,10 @@ public class OpportunityAwareRDWRedirector : Redirector
         float decelerationScore = NormalizeRange(deceleration, decelerationOpportunityLow, decelerationOpportunityHigh);
         float opportunityScore = Mathf.Clamp01(0.65f * turnScore + 0.35f * decelerationScore);
 
-        // 左右可转向性从侧向自由空间不平衡估计。
-        // 正的 clearanceBias 表示左侧比右侧更开阔。
-        float clearanceDelta = currentState.leftClearance - currentState.rightClearance;
-        float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
-        float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
-
         GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias, globalSafeField);
-        int desiredDirection = ComputeDesiredSteeringDirection(desiredFacingDirection);
-        float steerabilityMagnitude = Mathf.Clamp01(Mathf.Max(Mathf.Abs(clearanceBias), globalSafeField.strength));
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, globalSafeField);
+        float steerabilityMagnitude = Mathf.Clamp01(globalSafeField.strength);
+        int directionalConsistency = ComputeDirectionalConsistency(desiredFacingDirection, averageAngularSpeed);
 
         float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
         float budgetFactor = Mathf.Clamp01(
@@ -344,17 +327,16 @@ public class OpportunityAwareRDWRedirector : Redirector
             + steerabilityBudgetWeight * steerabilityMagnitude
             + opportunityBudgetWeight * opportunityScore);
 
-        // 预测器不直接输出增益。
-        // 它只说明调度器本帧被允许使用多少增益。
         float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
-        float curvatureBudget = DefaultCurvatureCapDegreesPerSecond * deltaTime * budgetFactor;
-        float rotationBudget = DefaultRotationCapDegreesPerSecond * deltaTime * budgetFactor;
-        float translationBudget = Mathf.Lerp(0f, -globalConfiguration.MIN_TRANS_GAIN, budgetFactor);
+        float curvatureBudget = DefaultCurvatureCapDegreesPerSecond * deltaTime * (baseBudgetCapScale * budgetFactor);
+        float rotationBudget = DefaultRotationCapDegreesPerSecond * deltaTime * (baseBudgetCapScale * budgetFactor);
+        float translationBudget = Mathf.Lerp(0f, -globalConfiguration.MIN_TRANS_GAIN * baseBudgetCapScale, budgetFactor);
 
         return new PredictorOutput
         {
             opportunityScore = opportunityScore,
-            steerability = desiredDirection * steerabilityMagnitude,
+            steerability = steerabilityMagnitude,
+            directionalConsistency = directionalConsistency,
             gainBudget = new Vector3(curvatureBudget, rotationBudget, translationBudget),
             criticalBoundaryRisk = currentState.nearestBoundaryDistance <= criticalBoundaryDistance,
             naturalTurningDetected = turnScore > 0.5f,
@@ -367,21 +349,14 @@ public class OpportunityAwareRDWRedirector : Redirector
     {
         TemporalState currentState = GetCurrentState();
         float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
-        float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
-        float clearanceDelta = currentState.leftClearance - currentState.rightClearance;
-        float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
-        float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
-
         GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias, globalSafeField);
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, globalSafeField);
         int desiredDirection = ComputeDesiredSteeringDirection(desiredFacingDirection);
         if (desiredDirection == 0)
         {
             desiredDirection = previousSteeringDirection;
         }
 
-        // 基础提议是控制器的几何部分：
-        // "如果暂时忽略机会，现在应该向哪个方向以及多强地尝试引导这个用户？"
         float curvatureDegrees = 0f;
         if (currentState.speed > movementThresholdMetersPerSecond)
         {
@@ -401,9 +376,9 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         float translationGain = 0f;
-        if (currentState.speed > movementThresholdMetersPerSecond && boundaryRisk > 0.35f)
+        if (currentState.speed > movementThresholdMetersPerSecond && Vector2.Dot(desiredFacingDirection, currentState.forwardReal) < 0f)
         {
-            translationGain = Mathf.Lerp(0f, -globalConfiguration.MIN_TRANS_GAIN, boundaryRisk);
+            translationGain = -globalConfiguration.MIN_TRANS_GAIN;
         }
 
         return new BaseControlProposal
@@ -419,64 +394,58 @@ public class OpportunityAwareRDWRedirector : Redirector
     // 增益调度器：根据机会评估和预算约束，调整并平滑最终应用的增益
     private Vector3 ScheduleGains(BaseControlProposal baseControl, PredictorOutput predictor, out bool usedCriticalFallback, out int selectedSteeringDirection)
     {
-        // 机会调节强度，而不是方向。
-        // 即使机会很弱，我们仍然允许非零的最小 alpha，
-        // 这样控制器可以响应而不是完全空闲。
-        float effectiveAlpha = Mathf.Lerp(minOpportunityAlpha, 1f, predictor.opportunityScore);
-        usedCriticalFallback = predictor.criticalBoundaryRisk && predictor.opportunityScore < lowOpportunityThreshold;
-        if (usedCriticalFallback)
+        float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
+        float boundaryRisk = ComputeCombinedBoundaryRisk(GetCurrentState());
+        bool pureApfFallback = predictor.criticalBoundaryRisk || boundaryRisk >= highRiskOverrideThreshold;
+        usedCriticalFallback = pureApfFallback;
+
+        float effectiveAlpha = pureApfFallback ? 1f : GetSoftModulationBeta(predictor);
+        if (postResetBoostTimer > 0f)
         {
-            // 如果边界风险紧迫，安全性优先于隐蔽性。
-            effectiveAlpha = Mathf.Max(effectiveAlpha, fallbackAlphaOnCriticalRisk);
+            effectiveAlpha = pureApfFallback ? 1f : Mathf.Max(effectiveAlpha, postResetAlphaFloor);
+            postResetBoostTimer = Mathf.Max(0f, postResetBoostTimer - deltaTime);
         }
 
-        // 当预测器的可转向性足够自信时，优先使用其符号；
-        // 否则回退到基础控制器的几何方向。
-        selectedSteeringDirection = Mathf.Abs(predictor.steerability) >= steeringEpsilon
-            ? (int)Mathf.Sign(predictor.steerability)
-            : baseControl.desiredDirection;
+        selectedSteeringDirection = baseControl.desiredDirection;
         if (selectedSteeringDirection == 0)
         {
             selectedSteeringDirection = previousSteeringDirection;
         }
 
-        float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
-        float boundaryRisk = ComputeCombinedBoundaryRisk(GetCurrentState());
-        bool highRiskOverride = boundaryRisk >= highRiskOverrideThreshold;
-        if (highRiskOverride)
+        if (!pureApfFallback)
         {
-            effectiveAlpha = Mathf.Max(effectiveAlpha, 0.9f);
+            selectedSteeringDirection = ApplySteeringHysteresis(
+                selectedSteeringDirection,
+                predictor.steerability,
+                boundaryRisk,
+                deltaTime);
         }
 
-        if (postResetBoostTimer > 0f)
+        float targetCurvature;
+        float targetRotation;
+        float targetTranslation;
+        if (pureApfFallback)
         {
-            effectiveAlpha = Mathf.Max(effectiveAlpha, postResetAlphaFloor);
-            postResetBoostTimer = Mathf.Max(0f, postResetBoostTimer - deltaTime);
+            targetCurvature = baseControl.curvatureDegrees;
+            targetRotation = baseControl.rotationDegrees;
+            targetTranslation = baseControl.translationGain;
+        }
+        else
+        {
+            float curvatureBudget = predictor.gainBudget.x;
+            float rotationBudget = predictor.gainBudget.y;
+            float translationBudget = predictor.gainBudget.z;
+
+            targetCurvature = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * effectiveAlpha, curvatureBudget);
+            targetRotation = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * effectiveAlpha, rotationBudget);
+            targetTranslation = Mathf.Min(Mathf.Abs(baseControl.translationGain) * effectiveAlpha, translationBudget);
         }
 
-        selectedSteeringDirection = ApplySteeringHysteresis(
-            selectedSteeringDirection,
-            Mathf.Abs(predictor.steerability),
-            boundaryRisk,
-            deltaTime);
-
-        float curvatureBudget = predictor.gainBudget.x;
-        float rotationBudget = predictor.gainBudget.y;
-        if (highRiskOverride)
-        {
-            curvatureBudget = Mathf.Max(curvatureBudget, DefaultCurvatureCapDegreesPerSecond * deltaTime * highRiskBudgetFloor);
-            rotationBudget = Mathf.Max(rotationBudget, DefaultRotationCapDegreesPerSecond * deltaTime * highRiskBudgetFloor);
-        }
-
-        // 首先应用机会缩放，然后用预测的预算进行裁剪。
-        float targetCurvature = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * effectiveAlpha, curvatureBudget);
-        float targetRotation = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * effectiveAlpha, rotationBudget);
-        float targetTranslation = Mathf.Min(Mathf.Abs(baseControl.translationGain) * effectiveAlpha, predictor.gainBudget.z);
-
-        // 平滑调度的增益，使控制器不会在帧之间抖动。
-        float smoothedCurvature = Mathf.Lerp(previousAppliedGains.x, targetCurvature, gainSmoothingFactor);
-        float smoothedRotation = Mathf.Lerp(previousAppliedGains.y, targetRotation, gainSmoothingFactor);
-        float smoothedTranslation = Mathf.Lerp(previousAppliedGains.z, targetTranslation, translationSmoothingFactor);
+        float angularSmoothing = pureApfFallback ? 1f : gainSmoothingFactor;
+        float linearSmoothing = pureApfFallback ? 1f : translationSmoothingFactor;
+        float smoothedCurvature = Mathf.Lerp(previousAppliedGains.x, targetCurvature, angularSmoothing);
+        float smoothedRotation = Mathf.Lerp(previousAppliedGains.y, targetRotation, angularSmoothing);
+        float smoothedTranslation = Mathf.Lerp(previousAppliedGains.z, targetTranslation, linearSmoothing);
 
         return new Vector3(smoothedCurvature, smoothedRotation, smoothedTranslation);
     }
@@ -526,12 +495,13 @@ public class OpportunityAwareRDWRedirector : Redirector
         lastBoundaryDistance = currentState.nearestBoundaryDistance;
         lastPredictedBoundaryDistance = currentState.predictedBoundaryDistance;
         lastGlobalSafeStrength = ComputeGlobalSafeField(currentState).strength;
+        lastDirectionalConsistency = predictor.directionalConsistency;
         lastSteerDirection = selectedSteeringDirection;
         lastUsedCriticalFallback = usedCriticalFallback;
         lastDecisionSummary = string.Format(
-            "O={0:F2}, steer={1:F2}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), final=({11:F2},{12:F2},{13:F2}), naturalTurn={14}, decel={15}, criticalFallback={16}, postResetBoost={17:F2}",
+            "O={0:F2}, consistency={1}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), final=({11:F2},{12:F2},{13:F2}), naturalTurn={14}, decel={15}, criticalFallback={16}, postResetBoost={17:F2}",
             predictor.opportunityScore,
-            predictor.steerability,
+            predictor.directionalConsistency,
             currentState.nearestBoundaryDistance,
             currentState.predictedBoundaryDistance,
             lastGlobalSafeStrength,
@@ -664,56 +634,23 @@ public class OpportunityAwareRDWRedirector : Redirector
         return Mathf.Clamp(Mathf.Max(targetAngle, minimumResetAngle), 75f, 180f);
     }
 
-    // 计算期望朝向方向：结合追踪空间中心引导和侧向逃逸偏置
-    private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, float clearanceBias, GlobalSafeField globalSafeField)
+    // 当前版本的 OAR v2 采用 APF 风格全局安全方向作为 subtle redirector 的底层骨架。
+    // 机会层只调制增益强度，不再覆盖这个方向。
+    private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, GlobalSafeField globalSafeField)
     {
-        // 控制器混合四种直觉：
-        // 1) 跟随当前 waypoint 的任务方向
-        // 2) 跟随 APF 风格的全局安全方向
-        // 3) 转向回到追踪空间中心
-        // 4) 偏向有更多侧向自由空间的一侧
-        Vector2 waypointDirection = GetWaypointDirectionReal(currentState);
         Vector2 globalSafeDirection = globalSafeField.direction;
+        if (globalSafeDirection.sqrMagnitude > Utilities.eps)
+        {
+            return globalSafeDirection.normalized;
+        }
+
         Vector2 centerDirection = GetTrackingSpaceCentroid() - currentState.positionReal;
         if (centerDirection.sqrMagnitude <= Utilities.eps)
         {
             centerDirection = currentState.forwardReal;
         }
         centerDirection.Normalize();
-
-        Vector2 saferLateralDirection = clearanceBias >= 0f
-            ? Utilities.RotateVector(currentState.forwardReal, -90f)
-            : Utilities.RotateVector(currentState.forwardReal, 90f);
-        saferLateralDirection.Normalize();
-
-        float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
-        float waypointBlend = Mathf.Lerp(waypointBlendWhenSafe, waypointBlendAtCriticalRisk, boundaryRisk);
-        float globalSafeBlend = Mathf.Lerp(globalSafeBlendWhenSafe, globalSafeBlendAtCriticalRisk, boundaryRisk);
-        float centerBlend = Mathf.Lerp(centerBlendWhenSafe, centerBlendAtCriticalRisk, boundaryRisk);
-        float lateralBlend = Mathf.Lerp(lateralEscapeBlendWhenSafe, lateralEscapeBlendAtCriticalRisk, boundaryRisk);
-        lateralBlend *= Mathf.Clamp01(Mathf.Abs(clearanceBias));
-
-        if (globalSafeField.strength <= Utilities.eps)
-        {
-            globalSafeBlend = 0f;
-        }
-
-        float totalBlend = waypointBlend + globalSafeBlend + centerBlend + lateralBlend;
-        Vector2 desiredFacingDirection =
-            waypointBlend * waypointDirection +
-            globalSafeBlend * globalSafeDirection +
-            centerBlend * centerDirection +
-            lateralBlend * saferLateralDirection;
-        if (totalBlend > Utilities.eps)
-        {
-            desiredFacingDirection /= totalBlend;
-        }
-        desiredFacingDirection.Normalize();
-        if (desiredFacingDirection.sqrMagnitude <= Utilities.eps)
-        {
-            desiredFacingDirection = waypointDirection;
-        }
-        return desiredFacingDirection;
+        return centerDirection;
     }
 
     private Vector2 ComputeResetFacingDirection(TemporalState currentState)
@@ -748,28 +685,6 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         return desiredFacingDirection.normalized;
-    }
-
-    private Vector2 GetWaypointDirectionReal(TemporalState currentState)
-    {
-        if (redirectionManager.targetWaypoint == null)
-        {
-            return currentState.forwardReal;
-        }
-
-        Vector3 waypointDirectionVirtual = Utilities.FlattenedPos3D(redirectionManager.targetWaypoint.position - redirectionManager.currPos);
-        if (waypointDirectionVirtual.sqrMagnitude <= Utilities.eps)
-        {
-            return currentState.forwardReal;
-        }
-
-        Vector2 waypointDirectionReal = Utilities.FlattenedDir2D(redirectionManager.GetDirReal(waypointDirectionVirtual));
-        if (waypointDirectionReal.sqrMagnitude <= Utilities.eps)
-        {
-            return currentState.forwardReal;
-        }
-
-        return waypointDirectionReal.normalized;
     }
 
     private GlobalSafeField ComputeGlobalSafeField(TemporalState currentState)
@@ -807,7 +722,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         {
             return new GlobalSafeField
             {
-                direction = currentState.forwardReal,
+                direction = Vector2.zero,
                 strength = 0f
             };
         }
@@ -923,6 +838,54 @@ public class OpportunityAwareRDWRedirector : Redirector
             desiredSteeringDirection = previousSteeringDirection;
         }
         return desiredSteeringDirection;
+    }
+
+    private int ComputeDirectionalConsistency(Vector2 desiredFacingDirection, float averageAngularSpeed)
+    {
+        if (desiredFacingDirection.sqrMagnitude <= Utilities.eps || averageAngularSpeed < rotationThresholdDegreesPerSecond)
+        {
+            return 0;
+        }
+
+        float signedAngleToTarget = Utilities.GetSignedAngle(
+            Utilities.UnFlatten(Utilities.FlattenedDir2D(redirectionManager.currDirReal)),
+            Utilities.UnFlatten(desiredFacingDirection.normalized));
+        if (Mathf.Abs(signedAngleToTarget) <= Utilities.eps || Mathf.Abs(redirectionManager.deltaDir) <= Utilities.eps)
+        {
+            return 0;
+        }
+
+        return Mathf.Sign(redirectionManager.deltaDir) == Mathf.Sign(signedAngleToTarget) ? 1 : -1;
+    }
+
+    private float GetSoftModulationBeta(PredictorOutput predictor)
+    {
+        if (predictor.criticalBoundaryRisk)
+        {
+            return 1f;
+        }
+
+        if (predictor.opportunityScore < lowOpportunityThreshold)
+        {
+            if (predictor.directionalConsistency < 0)
+            {
+                return lowOpportunityConflictBeta;
+            }
+
+            return lowOpportunityNeutralBeta;
+        }
+
+        if (predictor.opportunityScore > 0.7f)
+        {
+            if (predictor.directionalConsistency > 0)
+            {
+                return highOpportunityAlignedBeta;
+            }
+
+            return highOpportunityNeutralBeta;
+        }
+
+        return neutralOpportunityBeta;
     }
 
     private float ComputeCombinedBoundaryRisk(TemporalState currentState)

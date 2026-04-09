@@ -75,13 +75,13 @@ public class OpportunityAwareRDWRedirector : Redirector
     public float decelerationOpportunityHigh = 0.3f;
 
     [Range(0f, 1f)]
-    public float minOpportunityAlpha = 0.35f;
+    public float minOpportunityAlpha = 0.65f;
 
     [Range(0f, 1f)]
-    public float lowOpportunityThreshold = 0.35f;
+    public float lowOpportunityThreshold = 0.25f;
 
     [Range(0f, 1f)]
-    public float fallbackAlphaOnCriticalRisk = 0.8f;
+    public float fallbackAlphaOnCriticalRisk = 1f;
 
     [Range(0f, 1f)]
     public float steeringEpsilon = 0.12f;
@@ -94,29 +94,51 @@ public class OpportunityAwareRDWRedirector : Redirector
     public float comfortableBoundaryDistance = 2.0f;
 
     [Range(0f, 1f)]
-    public float lateralEscapeBlendAtCriticalRisk = 0.85f;
+    public float lateralEscapeBlendAtCriticalRisk = 0.5f;
 
     [Range(0f, 1f)]
-    public float lateralEscapeBlendWhenSafe = 0.2f;
+    public float lateralEscapeBlendWhenSafe = 0.15f;
+
+    [Header("任务引导 (Task Guidance)")]
+    [Range(0f, 1f)]
+    public float waypointBlendWhenSafe = 0.55f;
+
+    [Range(0f, 1f)]
+    public float waypointBlendAtCriticalRisk = 0.3f;
+
+    [Range(0f, 1f)]
+    public float centerBlendWhenSafe = 0.3f;
+
+    [Range(0f, 1f)]
+    public float centerBlendAtCriticalRisk = 0.2f;
 
     [Header("增益调度 (Gain Scheduling)")]
     [Range(0f, 1f)]
-    public float minBudgetFactor = 0.35f;
+    public float minBudgetFactor = 0.6f;
 
     [Range(0f, 1f)]
-    public float boundaryRiskBudgetWeight = 0.4f;
+    public float boundaryRiskBudgetWeight = 0.55f;
 
     [Range(0f, 1f)]
     public float steerabilityBudgetWeight = 0.35f;
 
     [Range(0f, 1f)]
-    public float opportunityBudgetWeight = 0.25f;
+    public float opportunityBudgetWeight = 0.1f;
 
     [Range(0f, 1f)]
-    public float gainSmoothingFactor = 0.3f;
+    public float gainSmoothingFactor = 0.45f;
 
     [Range(0f, 1f)]
-    public float translationSmoothingFactor = 0.2f;
+    public float translationSmoothingFactor = 0.3f;
+
+    [Range(0f, 1f)]
+    public float highRiskOverrideThreshold = 0.6f;
+
+    [Range(0f, 1f)]
+    public float highRiskBudgetFloor = 0.85f;
+
+    [Range(0f, 1f)]
+    public float secondaryAngularGainRatio = 0.35f;
 
     [Header("调试 (Debug)")]
     public bool enableRuntimeLogging = true;
@@ -357,9 +379,25 @@ public class OpportunityAwareRDWRedirector : Redirector
             selectedSteeringDirection = previousSteeringDirection;
         }
 
+        float boundaryRisk = ComputeBoundaryRisk(GetCurrentState().nearestBoundaryDistance);
+        bool highRiskOverride = boundaryRisk >= highRiskOverrideThreshold;
+        if (highRiskOverride)
+        {
+            effectiveAlpha = Mathf.Max(effectiveAlpha, 0.9f);
+        }
+
+        float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
+        float curvatureBudget = predictor.gainBudget.x;
+        float rotationBudget = predictor.gainBudget.y;
+        if (highRiskOverride)
+        {
+            curvatureBudget = Mathf.Max(curvatureBudget, DefaultCurvatureCapDegreesPerSecond * deltaTime * highRiskBudgetFloor);
+            rotationBudget = Mathf.Max(rotationBudget, DefaultRotationCapDegreesPerSecond * deltaTime * highRiskBudgetFloor);
+        }
+
         // 首先应用机会缩放，然后用预测的预算进行裁剪。
-        float targetCurvature = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * effectiveAlpha, predictor.gainBudget.x);
-        float targetRotation = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * effectiveAlpha, predictor.gainBudget.y);
+        float targetCurvature = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * effectiveAlpha, curvatureBudget);
+        float targetRotation = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * effectiveAlpha, rotationBudget);
         float targetTranslation = Mathf.Min(Mathf.Abs(baseControl.translationGain) * effectiveAlpha, predictor.gainBudget.z);
 
         // 平滑调度的增益，使控制器不会在帧之间抖动。
@@ -373,8 +411,9 @@ public class OpportunityAwareRDWRedirector : Redirector
     // 应用调度的增益：使用 OpenRDW 的现有注入接口
     private void ApplyScheduledGains(Vector3 scheduledGains)
     {
-        float appliedCurvature = 0f;
-        float appliedRotation = 0f;
+        bool rotationDominant = Mathf.Abs(scheduledGains.y) >= Mathf.Abs(scheduledGains.x);
+        float appliedCurvature = scheduledGains.x * (rotationDominant ? secondaryAngularGainRatio : 1f);
+        float appliedRotation = scheduledGains.y * (rotationDominant ? 1f : secondaryAngularGainRatio);
         float appliedTranslation = scheduledGains.z;
 
         if (appliedTranslation > 0f && redirectionManager.deltaPos.sqrMagnitude > Utilities.eps)
@@ -382,23 +421,14 @@ public class OpportunityAwareRDWRedirector : Redirector
             InjectTranslation(appliedTranslation * redirectionManager.deltaPos);
         }
 
-        // OpenRDW 通常应用旋转增益或曲率增益作为帧的主要角动作，
-        // 而不是两者都以全强度应用。
-        if (Mathf.Abs(scheduledGains.y) > Mathf.Abs(scheduledGains.x))
+        if (!Mathf.Approximately(appliedRotation, 0f))
         {
-            appliedRotation = scheduledGains.y;
-            if (!Mathf.Approximately(appliedRotation, 0f))
-            {
-                InjectRotation(appliedRotation);
-            }
+            InjectRotation(appliedRotation);
         }
-        else
+
+        if (!Mathf.Approximately(appliedCurvature, 0f))
         {
-            appliedCurvature = scheduledGains.x;
-            if (!Mathf.Approximately(appliedCurvature, 0f))
-            {
-                InjectCurvature(appliedCurvature);
-            }
+            InjectCurvature(appliedCurvature);
         }
 
         previousAppliedGains = new Vector3(appliedCurvature, appliedRotation, appliedTranslation);
@@ -532,9 +562,11 @@ public class OpportunityAwareRDWRedirector : Redirector
     // 计算期望朝向方向：结合追踪空间中心引导和侧向逃逸偏置
     private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, float clearanceBias)
     {
-        // 控制器混合两种直觉：
-        // 1) 转向回到追踪空间中心
-        // 2) 偏向有更多侧向自由空间的一侧
+        // 控制器混合三种直觉：
+        // 1) 跟随当前 waypoint 的任务方向
+        // 2) 转向回到追踪空间中心
+        // 3) 偏向有更多侧向自由空间的一侧
+        Vector2 waypointDirection = GetWaypointDirectionReal(currentState);
         Vector2 centerDirection = GetTrackingSpaceCentroid() - currentState.positionReal;
         if (centerDirection.sqrMagnitude <= Utilities.eps)
         {
@@ -548,15 +580,48 @@ public class OpportunityAwareRDWRedirector : Redirector
         saferLateralDirection.Normalize();
 
         float boundaryRisk = ComputeBoundaryRisk(currentState.nearestBoundaryDistance);
+        float waypointBlend = Mathf.Lerp(waypointBlendWhenSafe, waypointBlendAtCriticalRisk, boundaryRisk);
+        float centerBlend = Mathf.Lerp(centerBlendWhenSafe, centerBlendAtCriticalRisk, boundaryRisk);
         float lateralBlend = Mathf.Lerp(lateralEscapeBlendWhenSafe, lateralEscapeBlendAtCriticalRisk, boundaryRisk);
         lateralBlend *= Mathf.Clamp01(Mathf.Abs(clearanceBias));
 
-        Vector2 desiredFacingDirection = ((1f - lateralBlend) * centerDirection + lateralBlend * saferLateralDirection).normalized;
+        float totalBlend = waypointBlend + centerBlend + lateralBlend;
+        Vector2 desiredFacingDirection =
+            waypointBlend * waypointDirection +
+            centerBlend * centerDirection +
+            lateralBlend * saferLateralDirection;
+        if (totalBlend > Utilities.eps)
+        {
+            desiredFacingDirection /= totalBlend;
+        }
+        desiredFacingDirection.Normalize();
         if (desiredFacingDirection.sqrMagnitude <= Utilities.eps)
         {
-            desiredFacingDirection = centerDirection;
+            desiredFacingDirection = waypointDirection;
         }
         return desiredFacingDirection;
+    }
+
+    private Vector2 GetWaypointDirectionReal(TemporalState currentState)
+    {
+        if (redirectionManager.targetWaypoint == null)
+        {
+            return currentState.forwardReal;
+        }
+
+        Vector3 waypointDirectionVirtual = Utilities.FlattenedPos3D(redirectionManager.targetWaypoint.position - redirectionManager.currPos);
+        if (waypointDirectionVirtual.sqrMagnitude <= Utilities.eps)
+        {
+            return currentState.forwardReal;
+        }
+
+        Vector2 waypointDirectionReal = Utilities.FlattenedDir2D(redirectionManager.GetDirReal(waypointDirectionVirtual));
+        if (waypointDirectionReal.sqrMagnitude <= Utilities.eps)
+        {
+            return currentState.forwardReal;
+        }
+
+        return waypointDirectionReal.normalized;
     }
 
     // 计算期望转向方向（左转或右转）

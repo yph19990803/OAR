@@ -46,6 +46,12 @@ public class OpportunityAwareRDWRedirector : Redirector
         public float strength;
     }
 
+    private struct ThomasApfBackbone
+    {
+        public Vector2 negativeGradient;
+        public float repulsiveForce;
+    }
+
     private struct BaseControlProposal
     {
         public float curvatureDegrees;
@@ -137,13 +143,13 @@ public class OpportunityAwareRDWRedirector : Redirector
     public float secondaryAngularGainRatio = 0.35f;
 
     [Header("机会软调制 (Soft Opportunity Modulation)")]
-    [Range(0.8f, 1f)]
-    public float lowOpportunityConflictBeta = 0.9f;
+    [Range(1f, 1.05f)]
+    public float lowOpportunityConflictBeta = 1f;
 
-    [Range(0.9f, 1.05f)]
-    public float lowOpportunityNeutralBeta = 0.98f;
+    [Range(1f, 1.05f)]
+    public float lowOpportunityNeutralBeta = 1f;
 
-    [Range(0.95f, 1.05f)]
+    [Range(1f, 1.05f)]
     public float neutralOpportunityBeta = 1f;
 
     [Range(1f, 1.1f)]
@@ -315,9 +321,9 @@ public class OpportunityAwareRDWRedirector : Redirector
         float decelerationScore = NormalizeRange(deceleration, decelerationOpportunityLow, decelerationOpportunityHigh);
         float opportunityScore = Mathf.Clamp01(0.65f * turnScore + 0.35f * decelerationScore);
 
-        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, globalSafeField);
-        float steerabilityMagnitude = Mathf.Clamp01(globalSafeField.strength);
+        ThomasApfBackbone apfBackbone = ComputeThomasApfBackbone(currentState);
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, apfBackbone.negativeGradient);
+        float steerabilityMagnitude = Mathf.Clamp01(ComputeGlobalSafeField(currentState).strength);
         int directionalConsistency = ComputeDirectionalConsistency(desiredFacingDirection, averageAngularSpeed);
 
         float boundaryRisk = ComputeCombinedBoundaryRisk(currentState);
@@ -349,8 +355,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     {
         TemporalState currentState = GetCurrentState();
         float deltaTime = Mathf.Max(redirectionManager.GetDeltaTime(), Utilities.eps);
-        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
-        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, globalSafeField);
+        ThomasApfBackbone apfBackbone = ComputeThomasApfBackbone(currentState);
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, apfBackbone.negativeGradient);
         int desiredDirection = ComputeDesiredSteeringDirection(desiredFacingDirection);
         if (desiredDirection == 0)
         {
@@ -360,7 +366,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         float curvatureDegrees = 0f;
         if (currentState.speed > movementThresholdMetersPerSecond)
         {
-            float rotationFromCurvature = Mathf.Rad2Deg * (Utilities.FlattenedPos2D(redirectionManager.currPosReal - redirectionManager.prevPosReal).magnitude / globalConfiguration.CURVATURE_RADIUS);
+            float rotationFromCurvature = Mathf.Rad2Deg * (redirectionManager.deltaPos.magnitude / globalConfiguration.CURVATURE_RADIUS);
             float curvatureCap = DefaultCurvatureCapDegreesPerSecond * deltaTime;
             curvatureDegrees = desiredDirection * Mathf.Min(rotationFromCurvature, curvatureCap);
         }
@@ -453,9 +459,9 @@ public class OpportunityAwareRDWRedirector : Redirector
     // 应用调度的增益：使用 OpenRDW 的现有注入接口
     private void ApplyScheduledGains(Vector3 scheduledGains)
     {
-        bool rotationDominant = Mathf.Abs(scheduledGains.y) >= Mathf.Abs(scheduledGains.x);
-        float appliedCurvature = scheduledGains.x * (rotationDominant ? secondaryAngularGainRatio : 1f);
-        float appliedRotation = scheduledGains.y * (rotationDominant ? 1f : secondaryAngularGainRatio);
+        bool rotationDominant = Mathf.Abs(scheduledGains.y) > Mathf.Abs(scheduledGains.x);
+        float appliedCurvature = rotationDominant ? 0f : scheduledGains.x;
+        float appliedRotation = rotationDominant ? scheduledGains.y : 0f;
         float appliedTranslation = scheduledGains.z;
 
         if (appliedTranslation > 0f && redirectionManager.deltaPos.sqrMagnitude > Utilities.eps)
@@ -636,12 +642,11 @@ public class OpportunityAwareRDWRedirector : Redirector
 
     // 当前版本的 OAR v2 采用 APF 风格全局安全方向作为 subtle redirector 的底层骨架。
     // 机会层只调制增益强度，不再覆盖这个方向。
-    private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, GlobalSafeField globalSafeField)
+    private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, Vector2 apfDirection)
     {
-        Vector2 globalSafeDirection = globalSafeField.direction;
-        if (globalSafeDirection.sqrMagnitude > Utilities.eps)
+        if (apfDirection.sqrMagnitude > Utilities.eps)
         {
-            return globalSafeDirection.normalized;
+            return apfDirection.normalized;
         }
 
         Vector2 centerDirection = GetTrackingSpaceCentroid() - currentState.positionReal;
@@ -685,6 +690,67 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
 
         return desiredFacingDirection.normalized;
+    }
+
+    private ThomasApfBackbone ComputeThomasApfBackbone(TemporalState currentState)
+    {
+        List<Vector2> nearestPosList = new List<Vector2>();
+        Vector2 currPosReal = currentState.positionReal;
+
+        for (int i = 0; i < globalConfiguration.trackingSpacePoints.Count; i++)
+        {
+            Vector2 p = globalConfiguration.trackingSpacePoints[i];
+            Vector2 q = globalConfiguration.trackingSpacePoints[(i + 1) % globalConfiguration.trackingSpacePoints.Count];
+            Vector2 nearestPos = Utilities.GetNearestPos(currPosReal, new List<Vector2> { p, q });
+            nearestPosList.Add(nearestPos);
+        }
+
+        foreach (var obstacle in globalConfiguration.obstaclePolygons)
+        {
+            Vector2 nearestPos = Utilities.GetNearestPos(currPosReal, obstacle);
+            nearestPosList.Add(nearestPos);
+        }
+
+        foreach (var user in globalConfiguration.redirectedAvatars)
+        {
+            MovementManager otherMovementManager = user.GetComponent<MovementManager>();
+            if (otherMovementManager == null || otherMovementManager.avatarId == redirectionManager.movementManager.avatarId)
+            {
+                continue;
+            }
+
+            Vector2 nearestPos = Utilities.FlattenedPos2D(user.GetComponent<RedirectionManager>().currPosReal);
+            nearestPosList.Add(nearestPos);
+        }
+
+        float repulsiveForce = 0f;
+        Vector2 negativeGradient = Vector2.zero;
+        foreach (Vector2 obstaclePosition in nearestPosList)
+        {
+            float distance = (currPosReal - obstaclePosition).magnitude;
+            if (distance <= Utilities.eps)
+            {
+                continue;
+            }
+
+            repulsiveForce += 1f / distance;
+
+            Vector2 gradientContribution =
+                -Mathf.Pow(Mathf.Pow(currPosReal.x - obstaclePosition.x, 2) + Mathf.Pow(currPosReal.y - obstaclePosition.y, 2), -3f / 2f)
+                * (currPosReal - obstaclePosition);
+            negativeGradient += -gradientContribution;
+        }
+
+        if (negativeGradient.sqrMagnitude > Utilities.eps)
+        {
+            negativeGradient.Normalize();
+        }
+
+        return new ThomasApfBackbone
+        {
+            negativeGradient = negativeGradient,
+            repulsiveForce = repulsiveForce
+        };
     }
 
     private GlobalSafeField ComputeGlobalSafeField(TemporalState currentState)
@@ -885,7 +951,7 @@ public class OpportunityAwareRDWRedirector : Redirector
             return highOpportunityNeutralBeta;
         }
 
-        return neutralOpportunityBeta;
+        return Mathf.Max(1f, neutralOpportunityBeta);
     }
 
     private float ComputeCombinedBoundaryRisk(TemporalState currentState)

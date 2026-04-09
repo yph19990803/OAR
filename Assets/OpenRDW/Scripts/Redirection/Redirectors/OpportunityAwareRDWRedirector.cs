@@ -638,6 +638,23 @@ public class OpportunityAwareRDWRedirector : Redirector
         return 1f - Mathf.Clamp01(Mathf.InverseLerp(criticalBoundaryDistance, comfortableBoundaryDistance, boundaryDistance));
     }
 
+    public Vector2 GetRecommendedResetDirection()
+    {
+        TemporalState currentState = GetCurrentState();
+        float clearanceDelta = currentState.leftClearance - currentState.rightClearance;
+        float clearanceNormalizer = Mathf.Max(Mathf.Max(currentState.leftClearance, currentState.rightClearance), 0.1f);
+        float clearanceBias = Mathf.Clamp(clearanceDelta / clearanceNormalizer, -1f, 1f);
+        GlobalSafeField globalSafeField = ComputeGlobalSafeField(currentState);
+
+        Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, clearanceBias, globalSafeField);
+        if (desiredFacingDirection.sqrMagnitude <= Utilities.eps)
+        {
+            return currentState.forwardReal;
+        }
+
+        return desiredFacingDirection.normalized;
+    }
+
     // 计算期望朝向方向：结合追踪空间中心引导和侧向逃逸偏置
     private Vector2 ComputeDesiredFacingDirection(TemporalState currentState, float clearanceBias, GlobalSafeField globalSafeField)
     {

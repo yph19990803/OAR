@@ -197,6 +197,8 @@ public class OpportunityAwareRDWRedirector : Redirector
     [SerializeField]
     private Vector3 lastBaseControlSuggestion;
     [SerializeField]
+    private Vector3 lastBonusGains;
+    [SerializeField]
     private Vector3 lastFinalAppliedGains;
     [SerializeField]
     private float lastBoundaryDistance;
@@ -215,6 +217,7 @@ public class OpportunityAwareRDWRedirector : Redirector
 
     private readonly List<TemporalState> stateHistory = new List<TemporalState>();
     private Vector3 previousAppliedGains = Vector3.zero;
+    private Vector3 previousBonusGains = Vector3.zero;
     private int previousSteeringDirection = 1;
     private int lockedSteeringDirection = 1;
     private float steeringLockTimer;
@@ -247,6 +250,7 @@ public class OpportunityAwareRDWRedirector : Redirector
     {
         stateHistory.Clear();
         previousAppliedGains *= postResetGainRetention;
+        previousBonusGains *= postResetGainRetention;
         lockedSteeringDirection = previousSteeringDirection;
         steeringLockTimer = steeringLockDuration * 0.5f;
         postResetBoostTimer = postResetBoostDuration;
@@ -418,13 +422,13 @@ public class OpportunityAwareRDWRedirector : Redirector
             selectedSteeringDirection = previousSteeringDirection;
         }
 
-        if (!pureApfFallback)
+        float smoothedBonusCurvature = 0f;
+        float smoothedBonusRotation = 0f;
+        float smoothedBonusTranslation = 0f;
+
+        if (pureApfFallback)
         {
-            selectedSteeringDirection = ApplySteeringHysteresis(
-                selectedSteeringDirection,
-                predictor.steerability,
-                boundaryRisk,
-                deltaTime);
+            previousBonusGains = Vector3.zero;
         }
 
         float targetCurvature;
@@ -438,25 +442,37 @@ public class OpportunityAwareRDWRedirector : Redirector
         }
         else
         {
+            float bonusScale = Mathf.Max(0f, effectiveAlpha - 1f);
             float curvatureBudget = predictor.gainBudget.x;
             float rotationBudget = predictor.gainBudget.y;
-            float translationBudget = predictor.gainBudget.z;
+            bool rotationDominant = Mathf.Abs(baseControl.rotationDegrees) > Mathf.Abs(baseControl.curvatureDegrees);
 
-            targetCurvature = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * effectiveAlpha, curvatureBudget);
-            targetRotation = selectedSteeringDirection * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * effectiveAlpha, rotationBudget);
-            targetTranslation = Mathf.Min(Mathf.Abs(baseControl.translationGain) * effectiveAlpha, translationBudget);
+            if (rotationDominant)
+            {
+                float rotationExtraBudget = Mathf.Max(0f, rotationBudget - Mathf.Abs(baseControl.rotationDegrees));
+                float targetBonusRotation = Mathf.Sign(baseControl.rotationDegrees == 0f ? selectedSteeringDirection : baseControl.rotationDegrees)
+                    * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * bonusScale, rotationExtraBudget);
+                smoothedBonusRotation = Mathf.Lerp(previousBonusGains.y, targetBonusRotation, gainSmoothingFactor);
+            }
+            else
+            {
+                float curvatureExtraBudget = Mathf.Max(0f, curvatureBudget - Mathf.Abs(baseControl.curvatureDegrees));
+                float targetBonusCurvature = Mathf.Sign(baseControl.curvatureDegrees == 0f ? selectedSteeringDirection : baseControl.curvatureDegrees)
+                    * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * bonusScale, curvatureExtraBudget);
+                smoothedBonusCurvature = Mathf.Lerp(previousBonusGains.x, targetBonusCurvature, gainSmoothingFactor);
+            }
+
+            previousBonusGains = new Vector3(smoothedBonusCurvature, smoothedBonusRotation, smoothedBonusTranslation);
+
+            targetCurvature = baseControl.curvatureDegrees + smoothedBonusCurvature;
+            targetRotation = baseControl.rotationDegrees + smoothedBonusRotation;
+            targetTranslation = baseControl.translationGain + smoothedBonusTranslation;
         }
 
-        float angularSmoothing = pureApfFallback ? 1f : gainSmoothingFactor;
-        float linearSmoothing = pureApfFallback ? 1f : translationSmoothingFactor;
-        float smoothedCurvature = Mathf.Lerp(previousAppliedGains.x, targetCurvature, angularSmoothing);
-        float smoothedRotation = Mathf.Lerp(previousAppliedGains.y, targetRotation, angularSmoothing);
-        float smoothedTranslation = Mathf.Lerp(previousAppliedGains.z, targetTranslation, linearSmoothing);
-
-        return new Vector3(smoothedCurvature, smoothedRotation, smoothedTranslation);
+        return new Vector3(targetCurvature, targetRotation, targetTranslation);
     }
 
-    // 应用调度的增益：使用 OpenRDW 的现有注入接口
+    // 应用调度的增益：当前实现对齐 ThomasAPF，旋转与曲率二选一。
     private void ApplyScheduledGains(Vector3 scheduledGains)
     {
         bool rotationDominant = Mathf.Abs(scheduledGains.y) > Mathf.Abs(scheduledGains.x);
@@ -497,6 +513,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         lastSteerability = predictor.steerability;
         lastGainBudget = predictor.gainBudget;
         lastBaseControlSuggestion = new Vector3(baseControl.curvatureDegrees, baseControl.rotationDegrees, baseControl.translationGain);
+        lastBonusGains = previousBonusGains;
         lastFinalAppliedGains = previousAppliedGains;
         lastBoundaryDistance = currentState.nearestBoundaryDistance;
         lastPredictedBoundaryDistance = currentState.predictedBoundaryDistance;
@@ -505,7 +522,7 @@ public class OpportunityAwareRDWRedirector : Redirector
         lastSteerDirection = selectedSteeringDirection;
         lastUsedCriticalFallback = usedCriticalFallback;
         lastDecisionSummary = string.Format(
-            "O={0:F2}, consistency={1}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), final=({11:F2},{12:F2},{13:F2}), naturalTurn={14}, decel={15}, criticalFallback={16}, postResetBoost={17:F2}",
+            "O={0:F2}, consistency={1}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), bonus=({11:F2},{12:F2},{13:F2}), final=({14:F2},{15:F2},{16:F2}), naturalTurn={17}, decel={18}, criticalFallback={19}, postResetBoost={20:F2}",
             predictor.opportunityScore,
             predictor.directionalConsistency,
             currentState.nearestBoundaryDistance,
@@ -517,6 +534,9 @@ public class OpportunityAwareRDWRedirector : Redirector
             baseControl.curvatureDegrees,
             baseControl.rotationDegrees,
             baseControl.translationGain,
+            previousBonusGains.x,
+            previousBonusGains.y,
+            previousBonusGains.z,
             previousAppliedGains.x,
             previousAppliedGains.y,
             previousAppliedGains.z,

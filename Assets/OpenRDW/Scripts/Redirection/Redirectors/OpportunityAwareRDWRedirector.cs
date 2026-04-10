@@ -38,6 +38,13 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         public bool criticalBoundaryRisk;
         public bool naturalTurningDetected;
         public bool decelerationDetected;
+        public float turnOpportunityScore;
+        public float decelerationOpportunityScore;
+        public float waypointTurnOpportunity;
+        public float boundaryRiskTrendScore;
+        public float apfDirectionChangeScore;
+        public float timePressureScore;
+        public bool burstWindowDetected;
     }
 
     private struct GlobalSafeField
@@ -204,6 +211,34 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
     [Range(1f, 1.5f)]
     public float baseBudgetCapScale = 1.15f;
 
+    [Header("机会窗口 (Opportunity Burst)")]
+    [Range(0f, 1f)]
+    public float burstTriggerThreshold = 0.72f;
+
+    [Range(0f, 1f)]
+    public float burstSustainThreshold = 0.55f;
+
+    [Range(0f, 1f)]
+    public float burstFeatureThreshold = 0.35f;
+
+    [Min(0f)]
+    public float burstDuration = 0.45f;
+
+    [Min(0f)]
+    public float burstCooldown = 0.75f;
+
+    [Range(1f, 1.5f)]
+    public float burstAlphaFloor = 1.14f;
+
+    [Range(1f, 4f)]
+    public float burstBonusMultiplier = 2.4f;
+
+    [Range(0f, 1f)]
+    public float burstBudgetBoost = 0.35f;
+
+    [Range(0f, 1f)]
+    public float translationBonusRatio = 0.5f;
+
     [Header("转向稳定性 (Steering Hysteresis)")]
     [Min(0f)]
     public float steeringLockDuration = 0.75f;
@@ -256,6 +291,8 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
     [SerializeField]
     private bool lastUsedCriticalFallback;
     [SerializeField]
+    private bool lastBurstActive;
+    [SerializeField]
     private string lastDecisionSummary = string.Empty;
 
     private readonly List<TemporalState> stateHistory = new List<TemporalState>();
@@ -266,6 +303,8 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
     private float steeringLockTimer;
     private int updateCounter;
     private float postResetBoostTimer;
+    private float burstTimer;
+    private float burstCooldownTimer;
 
     public override void InjectRedirection()
     {
@@ -300,6 +339,8 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         lockedSteeringDirection = previousSteeringDirection;
         steeringLockTimer = steeringLockDuration * 0.5f;
         postResetBoostTimer = postResetBoostDuration;
+        burstTimer = 0f;
+        burstCooldownTimer = 0f;
         updateCounter = 0;
     }
 
@@ -411,7 +452,20 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
             gainBudget = new Vector3(curvatureBudget, rotationBudget, translationBudget),
             criticalBoundaryRisk = currentState.nearestBoundaryDistance <= criticalBoundaryDistance,
             naturalTurningDetected = turnScore > 0.5f,
-            decelerationDetected = decelerationScore > 0.5f
+            decelerationDetected = decelerationScore > 0.5f,
+            turnOpportunityScore = turnScore,
+            decelerationOpportunityScore = decelerationScore,
+            waypointTurnOpportunity = waypointTurnOpportunity,
+            boundaryRiskTrendScore = boundaryRiskTrendScore,
+            apfDirectionChangeScore = apfDirectionChangeScore,
+            timePressureScore = timePressureScore,
+            burstWindowDetected = IsBurstWindowDetected(
+                opportunityScore,
+                turnScore,
+                waypointTurnOpportunity,
+                boundaryRiskTrendScore,
+                apfDirectionChangeScore,
+                timePressureScore)
         };
     }
 
@@ -469,12 +523,17 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         float boundaryRisk = ComputeCombinedBoundaryRisk(GetCurrentState());
         bool pureApfFallback = predictor.criticalBoundaryRisk || boundaryRisk >= highRiskOverrideThreshold;
         usedCriticalFallback = pureApfFallback;
+        bool burstActive = UpdateBurstWindowState(predictor, pureApfFallback, deltaTime);
 
         float effectiveAlpha = pureApfFallback ? 1f : GetSoftModulationBeta(predictor);
         if (postResetBoostTimer > 0f)
         {
             effectiveAlpha = pureApfFallback ? 1f : Mathf.Max(effectiveAlpha, postResetAlphaFloor);
             postResetBoostTimer = Mathf.Max(0f, postResetBoostTimer - deltaTime);
+        }
+        if (burstActive && !pureApfFallback)
+        {
+            effectiveAlpha = Mathf.Max(effectiveAlpha, burstAlphaFloor);
         }
 
         selectedSteeringDirection = baseControl.desiredDirection;
@@ -503,24 +562,59 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         }
         else
         {
-            float bonusScale = Mathf.Max(0f, effectiveAlpha - 1f);
-            float curvatureBudget = predictor.gainBudget.x;
-            float rotationBudget = predictor.gainBudget.y;
-            bool rotationDominant = Mathf.Abs(baseControl.rotationDegrees) > Mathf.Abs(baseControl.curvatureDegrees);
-
-            if (rotationDominant)
+            Vector3 gainBudget = predictor.gainBudget;
+            if (burstActive)
             {
-                float rotationExtraBudget = Mathf.Max(0f, rotationBudget - Mathf.Abs(baseControl.rotationDegrees));
-                float targetBonusRotation = Mathf.Sign(baseControl.rotationDegrees == 0f ? selectedSteeringDirection : baseControl.rotationDegrees)
-                    * Mathf.Min(Mathf.Abs(baseControl.rotationDegrees) * bonusScale, rotationExtraBudget);
+                gainBudget *= 1f + burstBudgetBoost;
+            }
+
+            float bonusScale = Mathf.Max(0f, effectiveAlpha - 1f);
+            if (burstActive)
+            {
+                bonusScale *= burstBonusMultiplier;
+            }
+
+            float rotationOpportunityScale = Mathf.Clamp01(
+                0.55f * predictor.turnOpportunityScore
+                + 0.25f * Mathf.Max(0f, predictor.directionalConsistency)
+                + 0.20f * predictor.apfDirectionChangeScore);
+            float curvatureOpportunityScale = Mathf.Clamp01(
+                0.45f * predictor.waypointTurnOpportunity
+                + 0.35f * predictor.timePressureScore
+                + 0.20f * predictor.boundaryRiskTrendScore);
+            float translationOpportunityScale = Mathf.Clamp01(
+                0.50f * predictor.timePressureScore
+                + 0.30f * predictor.decelerationOpportunityScore
+                + 0.20f * predictor.boundaryRiskTrendScore);
+
+            float curvatureExtraBudget = Mathf.Max(0f, gainBudget.x - Mathf.Abs(baseControl.curvatureDegrees));
+            float rotationExtraBudget = Mathf.Max(0f, gainBudget.y - Mathf.Abs(baseControl.rotationDegrees));
+            float translationExtraBudget = Mathf.Max(0f, gainBudget.z - Mathf.Abs(baseControl.translationGain));
+
+            if (Mathf.Abs(baseControl.rotationDegrees) > Utilities.eps && rotationExtraBudget > 0f)
+            {
+                float targetBonusRotation = Mathf.Sign(baseControl.rotationDegrees)
+                    * Mathf.Min(
+                        Mathf.Abs(baseControl.rotationDegrees) * bonusScale * rotationOpportunityScale,
+                        rotationExtraBudget);
                 smoothedBonusRotation = Mathf.Lerp(previousBonusGains.y, targetBonusRotation, gainSmoothingFactor);
             }
-            else
+
+            if (Mathf.Abs(baseControl.curvatureDegrees) > Utilities.eps && curvatureExtraBudget > 0f)
             {
-                float curvatureExtraBudget = Mathf.Max(0f, curvatureBudget - Mathf.Abs(baseControl.curvatureDegrees));
-                float targetBonusCurvature = Mathf.Sign(baseControl.curvatureDegrees == 0f ? selectedSteeringDirection : baseControl.curvatureDegrees)
-                    * Mathf.Min(Mathf.Abs(baseControl.curvatureDegrees) * bonusScale, curvatureExtraBudget);
+                float targetBonusCurvature = Mathf.Sign(baseControl.curvatureDegrees)
+                    * Mathf.Min(
+                        Mathf.Abs(baseControl.curvatureDegrees) * bonusScale * curvatureOpportunityScale,
+                        curvatureExtraBudget);
                 smoothedBonusCurvature = Mathf.Lerp(previousBonusGains.x, targetBonusCurvature, gainSmoothingFactor);
+            }
+
+            if (baseControl.translationGain > 0f && translationExtraBudget > 0f)
+            {
+                float targetBonusTranslation = Mathf.Min(
+                    baseControl.translationGain * bonusScale * translationOpportunityScale * translationBonusRatio,
+                    translationExtraBudget);
+                smoothedBonusTranslation = Mathf.Lerp(previousBonusGains.z, targetBonusTranslation, translationSmoothingFactor);
             }
 
             previousBonusGains = new Vector3(smoothedBonusCurvature, smoothedBonusRotation, smoothedBonusTranslation);
@@ -582,8 +676,9 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         lastDirectionalConsistency = predictor.directionalConsistency;
         lastSteerDirection = selectedSteeringDirection;
         lastUsedCriticalFallback = usedCriticalFallback;
+        lastBurstActive = burstTimer > 0f;
         lastDecisionSummary = string.Format(
-            "O={0:F2}, consistency={1}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), bonus=({11:F2},{12:F2},{13:F2}), final=({14:F2},{15:F2},{16:F2}), naturalTurn={17}, decel={18}, criticalFallback={19}, postResetBoost={20:F2}",
+            "O={0:F2}, consistency={1}, boundary=({2:F2}->{3:F2}), globalSafe={4:F2}, budget=({5:F2},{6:F2},{7:F2}), base=({8:F2},{9:F2},{10:F2}), bonus=({11:F2},{12:F2},{13:F2}), final=({14:F2},{15:F2},{16:F2}), naturalTurn={17}, decel={18}, criticalFallback={19}, postResetBoost={20:F2}, burst={21}",
             predictor.opportunityScore,
             predictor.directionalConsistency,
             currentState.nearestBoundaryDistance,
@@ -604,7 +699,8 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
             predictor.naturalTurningDetected,
             predictor.decelerationDetected,
             usedCriticalFallback,
-            postResetBoostTimer);
+            postResetBoostTimer,
+            lastBurstActive);
 
         if (enableRuntimeLogging && (verboseRuntimeLogging || updateCounter % debugLogEveryNFrames == 0))
         {
@@ -1033,6 +1129,56 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         }
 
         return Mathf.Max(1f, neutralOpportunityBeta);
+    }
+
+    private bool UpdateBurstWindowState(PredictorOutput predictor, bool pureApfFallback, float deltaTime)
+    {
+        if (pureApfFallback)
+        {
+            burstTimer = 0f;
+            burstCooldownTimer = Mathf.Max(0f, burstCooldownTimer - deltaTime);
+            return false;
+        }
+
+        burstCooldownTimer = Mathf.Max(0f, burstCooldownTimer - deltaTime);
+
+        bool burstActive = burstTimer > 0f;
+        bool canTrigger = burstCooldownTimer <= Utilities.eps && predictor.burstWindowDetected;
+        bool sustain = burstActive && predictor.opportunityScore >= burstSustainThreshold;
+
+        if (!burstActive && canTrigger)
+        {
+            burstTimer = burstDuration;
+            burstCooldownTimer = burstCooldown;
+            burstActive = true;
+        }
+        else if (sustain)
+        {
+            burstTimer = Mathf.Max(burstTimer, burstDuration * 0.5f);
+        }
+
+        burstTimer = Mathf.Max(0f, burstTimer - deltaTime);
+        return burstActive;
+    }
+
+    private bool IsBurstWindowDetected(
+        float opportunityScore,
+        float turnScore,
+        float waypointTurnOpportunity,
+        float boundaryRiskTrendScore,
+        float apfDirectionChangeScore,
+        float timePressureScore)
+    {
+        if (opportunityScore < burstTriggerThreshold)
+        {
+            return false;
+        }
+
+        return waypointTurnOpportunity >= burstFeatureThreshold
+            || boundaryRiskTrendScore >= burstFeatureThreshold
+            || apfDirectionChangeScore >= burstFeatureThreshold
+            || timePressureScore >= burstFeatureThreshold
+            || turnScore >= burstFeatureThreshold;
     }
 
     private float ComputeCombinedBoundaryRisk(TemporalState currentState)

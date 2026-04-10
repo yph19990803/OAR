@@ -6,7 +6,7 @@ using System.Collections.Generic;
 // 2）机会层只估计“当前是否更适合隐藏增益”，不再覆盖 APF 方向
 // 3）调度层只做轻量缩放与上限保护
 // 4）高风险时直接退回纯 APF 输出
-public class OpportunityAwareRDWRedirector : Redirector
+public class OpportunityAwareRDWRedirector : APF_Redirector
 {
     private const float DefaultRotationCapDegreesPerSecond = 30f;
     private const float DefaultCurvatureCapDegreesPerSecond = 15f;
@@ -239,6 +239,9 @@ public class OpportunityAwareRDWRedirector : Redirector
 
         PredictorOutput predictor = PredictOpportunity(); 
         BaseControlProposal baseControl = ComputeBaseControlProposal();
+        UpdateTotalForcePointer(baseControl.desiredFacingDirection.sqrMagnitude > Utilities.eps
+            ? baseControl.desiredFacingDirection.normalized
+            : Vector2.zero);
 
         Vector3 scheduledGains = ScheduleGains(baseControl, predictor, out bool usedCriticalFallback, out int selectedSteeringDirection);
         ApplyScheduledGains(scheduledGains);

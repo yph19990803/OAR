@@ -93,12 +93,43 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
     [Range(0f, 1f)]
     public float steeringEpsilon = 0.12f;
 
+    [Header("路径阶段机会 (Path-Stage Opportunity)")]
+    [Min(0f)]
+    public float waypointOpportunityNearDistance = 1.5f;
+
+    [Min(0f)]
+    public float waypointTurnLowDegrees = 20f;
+
+    [Min(0f)]
+    public float waypointTurnHighDegrees = 75f;
+
+    [Range(0f, 1f)]
+    public float behaviorOpportunityWeight = 0.25f;
+
+    [Range(0f, 1f)]
+    public float waypointTurnOpportunityWeight = 0.35f;
+
+    [Range(0f, 1f)]
+    public float riskTrendOpportunityWeight = 0.2f;
+
+    [Range(0f, 1f)]
+    public float apfChangeOpportunityWeight = 0.1f;
+
+    [Range(0f, 1f)]
+    public float timePressureOpportunityWeight = 0.1f;
+
     [Header("安全设置 (Safety)")]
     [Min(0.1f)]
     public float criticalBoundaryDistance = 0.75f;
 
     [Min(0.2f)]
     public float comfortableBoundaryDistance = 2.0f;
+
+    [Min(0f)]
+    public float boundaryRiskRiseLow = 0.03f;
+
+    [Min(0f)]
+    public float boundaryRiskRiseHigh = 0.18f;
 
     [Min(0f)]
     public float forwardPredictionDistance = 1.25f;
@@ -108,6 +139,18 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
 
     [Min(0f)]
     public float predictionLateralSpread = 0.35f;
+
+    [Min(0f)]
+    public float apfDirectionChangeLowDegrees = 5f;
+
+    [Min(0f)]
+    public float apfDirectionChangeHighDegrees = 25f;
+
+    [Min(0f)]
+    public float timeToBoundaryLowSeconds = 0.75f;
+
+    [Min(0f)]
+    public float timeToBoundaryHighSeconds = 2.5f;
 
     [Header("APF 安全骨架 (APF Backbone)")]
 
@@ -326,7 +369,22 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         // 控制器认为此时更容易隐藏重定向。
         float turnScore = NormalizeRange(averageAngularSpeed, turnOpportunityLowDegreesPerSecond, turnOpportunityHighDegreesPerSecond);
         float decelerationScore = NormalizeRange(deceleration, decelerationOpportunityLow, decelerationOpportunityHigh);
-        float opportunityScore = Mathf.Clamp01(0.65f * turnScore + 0.35f * decelerationScore);
+        float behaviorOpportunity = Mathf.Clamp01(0.65f * turnScore + 0.35f * decelerationScore);
+
+        float waypointProximityScore = ComputeWaypointProximityScore(currentState.distanceToWaypoint);
+        float upcomingTurnScore = ComputeUpcomingTurnScore(currentState);
+        float waypointTurnOpportunity = waypointProximityScore * upcomingTurnScore;
+
+        float boundaryRiskTrendScore = ComputeBoundaryRiskTrendScore();
+        float apfDirectionChangeScore = ComputeApfDirectionChangeScore(currentState);
+        float timePressureScore = ComputeTimePressureScore(currentState);
+
+        float opportunityScore = Mathf.Clamp01(
+            behaviorOpportunityWeight * behaviorOpportunity +
+            waypointTurnOpportunityWeight * waypointTurnOpportunity +
+            riskTrendOpportunityWeight * boundaryRiskTrendScore +
+            apfChangeOpportunityWeight * apfDirectionChangeScore +
+            timePressureOpportunityWeight * timePressureScore);
 
         ThomasApfBackbone apfBackbone = ComputeThomasApfBackbone(currentState);
         Vector2 desiredFacingDirection = ComputeDesiredFacingDirection(currentState, apfBackbone.negativeGradient);
@@ -982,6 +1040,97 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         float instantRisk = ComputeBoundaryRisk(currentState.nearestBoundaryDistance);
         float predictedRisk = ComputeBoundaryRisk(currentState.predictedBoundaryDistance);
         return Mathf.Max(instantRisk, Mathf.Lerp(instantRisk, predictedRisk, predictionWeight));
+    }
+
+    private float ComputeWaypointProximityScore(float distanceToWaypoint)
+    {
+        if (waypointOpportunityNearDistance <= Utilities.eps)
+        {
+            return 0f;
+        }
+
+        return 1f - Mathf.Clamp01(distanceToWaypoint / waypointOpportunityNearDistance);
+    }
+
+    private float ComputeUpcomingTurnScore(TemporalState currentState)
+    {
+        List<Vector2> waypoints = movementManager.waypoints;
+        if (waypoints == null || waypoints.Count < 2)
+        {
+            return 0f;
+        }
+
+        int waypointIndex = movementManager.waypointIterator;
+        if (waypointIndex < 0 || waypointIndex >= waypoints.Count - 1)
+        {
+            return 0f;
+        }
+
+        Vector2 currentTarget = waypoints[waypointIndex];
+        Vector2 currentSegmentDirection = waypointIndex > 0
+            ? currentTarget - waypoints[waypointIndex - 1]
+            : currentTarget - currentState.positionReal;
+        Vector2 nextSegmentDirection = waypoints[waypointIndex + 1] - currentTarget;
+
+        if (currentSegmentDirection.sqrMagnitude <= Utilities.eps || nextSegmentDirection.sqrMagnitude <= Utilities.eps)
+        {
+            return 0f;
+        }
+
+        float turnAngle = Vector2.Angle(currentSegmentDirection, nextSegmentDirection);
+        return NormalizeRange(turnAngle, waypointTurnLowDegrees, waypointTurnHighDegrees);
+    }
+
+    private float ComputeBoundaryRiskTrendScore()
+    {
+        if (stateHistory.Count < 2)
+        {
+            return 0f;
+        }
+
+        TemporalState currentState = stateHistory[stateHistory.Count - 1];
+        TemporalState previousState = stateHistory[stateHistory.Count - 2];
+        float currentRisk = ComputeCombinedBoundaryRisk(currentState);
+        float previousRisk = ComputeCombinedBoundaryRisk(previousState);
+        float riskRise = Mathf.Max(0f, currentRisk - previousRisk);
+        return NormalizeRange(riskRise, boundaryRiskRiseLow, boundaryRiskRiseHigh);
+    }
+
+    private float ComputeApfDirectionChangeScore(TemporalState currentState)
+    {
+        if (stateHistory.Count < 2)
+        {
+            return 0f;
+        }
+
+        Vector2 currentDirection = ComputeThomasApfBackbone(currentState).negativeGradient;
+        TemporalState previousState = stateHistory[stateHistory.Count - 2];
+        Vector2 previousDirection = ComputeThomasApfBackbone(previousState).negativeGradient;
+
+        if (currentDirection.sqrMagnitude <= Utilities.eps || previousDirection.sqrMagnitude <= Utilities.eps)
+        {
+            return 0f;
+        }
+
+        float directionChange = Vector2.Angle(currentDirection, previousDirection);
+        return NormalizeRange(directionChange, apfDirectionChangeLowDegrees, apfDirectionChangeHighDegrees);
+    }
+
+    private float ComputeTimePressureScore(TemporalState currentState)
+    {
+        if (currentState.speed <= movementThresholdMetersPerSecond)
+        {
+            return 0f;
+        }
+
+        float timeToBoundary = currentState.predictedBoundaryDistance / Mathf.Max(currentState.speed, Utilities.eps);
+        if (timeToBoundaryHighSeconds <= timeToBoundaryLowSeconds)
+        {
+            return timeToBoundary <= timeToBoundaryLowSeconds ? 1f : 0f;
+        }
+
+        return 1f - Mathf.Clamp01(
+            Mathf.InverseLerp(timeToBoundaryLowSeconds, timeToBoundaryHighSeconds, timeToBoundary));
     }
 
     // 估计指定方向的间隙距离（用于左右间隙检测）

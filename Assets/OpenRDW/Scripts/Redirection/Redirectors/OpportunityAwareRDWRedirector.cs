@@ -213,13 +213,13 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
 
     [Header("机会窗口 (Opportunity Burst)")]
     [Range(0f, 1f)]
-    public float burstTriggerThreshold = 0.72f;
+    public float burstTriggerThreshold = 0.32f;
 
     [Range(0f, 1f)]
-    public float burstSustainThreshold = 0.55f;
+    public float burstSustainThreshold = 0.24f;
 
     [Range(0f, 1f)]
-    public float burstFeatureThreshold = 0.35f;
+    public float burstFeatureThreshold = 0.18f;
 
     [Min(0f)]
     public float burstDuration = 0.45f;
@@ -261,6 +261,7 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
 
     [Header("调试 (Debug)")]
     public bool enableRuntimeLogging = true;
+    public bool exportRuntimeDecisionLog = true;
     public bool verboseRuntimeLogging = false;
     [Min(1)]
     public int debugLogEveryNFrames = 45;
@@ -296,6 +297,7 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
     private string lastDecisionSummary = string.Empty;
 
     private readonly List<TemporalState> stateHistory = new List<TemporalState>();
+    private readonly List<string> runtimeDecisionLogLines = new List<string>();
     private Vector3 previousAppliedGains = Vector3.zero;
     private Vector3 previousBonusGains = Vector3.zero;
     private int previousSteeringDirection = 1;
@@ -342,6 +344,16 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
         burstTimer = 0f;
         burstCooldownTimer = 0f;
         updateCounter = 0;
+    }
+
+    public void ResetRuntimeDecisionLog()
+    {
+        runtimeDecisionLogLines.Clear();
+    }
+
+    public List<string> GetRuntimeDecisionLogLines()
+    {
+        return new List<string>(runtimeDecisionLogLines);
     }
 
     // 构建当前帧的时间状态快照，包含位置、速度、边界距离等关键信息
@@ -702,7 +714,17 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
             postResetBoostTimer,
             lastBurstActive);
 
-        if (enableRuntimeLogging && (verboseRuntimeLogging || updateCounter % debugLogEveryNFrames == 0))
+        bool shouldCaptureRuntimeLog = verboseRuntimeLogging || updateCounter % debugLogEveryNFrames == 0;
+        if (exportRuntimeDecisionLog && shouldCaptureRuntimeLog)
+        {
+            runtimeDecisionLogLines.Add(string.Format(
+                "frame={0}, time={1:F4}, {2}",
+                updateCounter,
+                globalConfiguration.GetTime(),
+                lastDecisionSummary));
+        }
+
+        if (enableRuntimeLogging && shouldCaptureRuntimeLog)
         {
             Debug.Log("[OpportunityAwareRDW] " + lastDecisionSummary, this);
         }

@@ -629,14 +629,61 @@ public class OpportunityAwareRDWRedirector : APF_Redirector
                 smoothedBonusTranslation = Mathf.Lerp(previousBonusGains.z, targetBonusTranslation, translationSmoothingFactor);
             }
 
-            previousBonusGains = new Vector3(smoothedBonusCurvature, smoothedBonusRotation, smoothedBonusTranslation);
-
             targetCurvature = baseControl.curvatureDegrees + smoothedBonusCurvature;
             targetRotation = baseControl.rotationDegrees + smoothedBonusRotation;
             targetTranslation = baseControl.translationGain + smoothedBonusTranslation;
         }
 
-        return new Vector3(targetCurvature, targetRotation, targetTranslation);
+        Vector3 strictThresholdGains = ClampScheduledGainsToThresholds(
+            new Vector3(targetCurvature, targetRotation, targetTranslation),
+            deltaTime);
+
+        if (pureApfFallback)
+        {
+            previousBonusGains = Vector3.zero;
+        }
+        else
+        {
+            previousBonusGains = strictThresholdGains - new Vector3(
+                baseControl.curvatureDegrees,
+                baseControl.rotationDegrees,
+                baseControl.translationGain);
+        }
+
+        return strictThresholdGains;
+    }
+
+    // 对最终增益做严格阈值约束，确保不会超过标准 RDW 阈值范围。
+    private Vector3 ClampScheduledGainsToThresholds(Vector3 scheduledGains, float deltaTime)
+    {
+        float clampedCurvature = 0f;
+        float deltaPosMagnitude = redirectionManager.deltaPos.magnitude;
+        if (deltaPosMagnitude > Utilities.eps)
+        {
+            float curvatureThresholdDegrees = Mathf.Rad2Deg * (deltaPosMagnitude / globalConfiguration.CURVATURE_RADIUS);
+            float curvatureCapDegrees = DefaultCurvatureCapDegreesPerSecond * deltaTime;
+            float maxAllowedCurvatureDegrees = Mathf.Min(curvatureThresholdDegrees, curvatureCapDegrees);
+            clampedCurvature = Mathf.Clamp(scheduledGains.x, -maxAllowedCurvatureDegrees, maxAllowedCurvatureDegrees);
+        }
+
+        float clampedRotation = 0f;
+        float deltaDir = redirectionManager.deltaDir;
+        if (Mathf.Abs(deltaDir) > Utilities.eps)
+        {
+            float rotationCapDegrees = DefaultRotationCapDegreesPerSecond * deltaTime;
+            float minRotationDegrees = deltaDir * globalConfiguration.MIN_ROT_GAIN;
+            float maxRotationDegrees = deltaDir * globalConfiguration.MAX_ROT_GAIN;
+            float lowerBound = Mathf.Max(Mathf.Min(minRotationDegrees, maxRotationDegrees), -rotationCapDegrees);
+            float upperBound = Mathf.Min(Mathf.Max(minRotationDegrees, maxRotationDegrees), rotationCapDegrees);
+            clampedRotation = Mathf.Clamp(scheduledGains.y, lowerBound, upperBound);
+        }
+
+        float clampedTranslation = Mathf.Clamp(
+            scheduledGains.z,
+            globalConfiguration.MIN_TRANS_GAIN,
+            globalConfiguration.MAX_TRANS_GAIN);
+
+        return new Vector3(clampedCurvature, clampedRotation, clampedTranslation);
     }
 
     // 应用调度的增益：当前实现对齐 ThomasAPF，旋转与曲率二选一。
